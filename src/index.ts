@@ -1,7 +1,7 @@
 // Telegram bot: long-polls for messages, guards + interprets them, and acts
 // (record entries / complete pending / summary / search / delete / export CSV).
 
-import { config } from "./config.js";
+import { config, ownerChat } from "./config.js";
 import {
   getUpdates,
   sendText,
@@ -24,6 +24,7 @@ import {
   buildWorkbook,
   buildPdf,
   composeAnswer,
+  getCreditInfo,
   runScheduledReports,
   checkCredit,
 } from "./reports.js";
@@ -176,6 +177,8 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
     const lower = text.toLowerCase();
     if (lower.startsWith("/start") || lower.startsWith("/help") || lower.startsWith("/ayuda")) {
       await sendText(chatId, WELCOME);
+    } else if (lower.startsWith("/creditos") || lower.startsWith("/crédito") || lower.startsWith("/credito") || lower.startsWith("/saldo")) {
+      await handleCredit(chatId);
     } else if (lower.startsWith("/pdf")) {
       await handleExport(chatId, "pdf");
     } else if (lower.startsWith("/export") || lower.startsWith("/exportar")) {
@@ -435,6 +438,26 @@ async function handleDeleteLast(chatId: number): Promise<void> {
   const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
   const header = removed.length > 1 ? `🗑️ Borré las últimas ${removed.length} anotaciones:` : "🗑️ Borré la última anotación:";
   await say(chatId, `${header}\n\n${blocks}`);
+}
+
+async function handleCredit(chatId: number): Promise<void> {
+  const owner = ownerChat();
+  if (owner !== null && chatId !== owner) {
+    await sendText(chatId, "Ese dato es solo para el administrador 🙂");
+    return;
+  }
+  const info = await getCreditInfo();
+  if (!info) {
+    await sendText(chatId, "No pude consultar el crédito ahora mismo. Probá de nuevo en un momento.");
+    return;
+  }
+  await sendText(
+    chatId,
+    "💳 Crédito de OpenRouter:\n\n" +
+      `• Disponible: $${info.remaining.toFixed(2)} USD\n` +
+      `• Usado: $${info.usage.toFixed(4)} USD\n` +
+      `• Cargado en total: $${info.total.toFixed(2)} USD`
+  );
 }
 
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";

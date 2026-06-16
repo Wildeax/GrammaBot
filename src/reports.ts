@@ -455,19 +455,37 @@ export async function runScheduledReports(): Promise<void> {
   }
 }
 
-/** Alert the owner when OpenRouter remaining credit drops below the threshold (once per low state). */
-export async function checkCredit(): Promise<void> {
-  const owner = ownerChat();
-  if (!owner) return;
+export interface CreditInfo {
+  total: number;
+  usage: number;
+  remaining: number;
+}
+
+/** Fetch OpenRouter credit info. Returns null if unavailable or not OpenRouter. */
+export async function getCreditInfo(): Promise<CreditInfo | null> {
   try {
     const res = await fetch(`${config.llm.baseUrl}/credits`, {
       headers: { Authorization: `Bearer ${config.llm.apiKey}` },
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) return; // not OpenRouter or transient — skip silently
+    if (!res.ok) return null;
     const d = (await res.json()) as { data?: { total_credits?: number; total_usage?: number } };
-    if (!d.data) return;
-    const remaining = Number(d.data.total_credits ?? 0) - Number(d.data.total_usage ?? 0);
+    if (!d.data) return null;
+    const total = Number(d.data.total_credits ?? 0);
+    const usage = Number(d.data.total_usage ?? 0);
+    return { total, usage, remaining: total - usage };
+  } catch {
+    return null;
+  }
+}
+
+/** Alert the owner when OpenRouter remaining credit drops below the threshold (once per low state). */
+export async function checkCredit(): Promise<void> {
+  const owner = ownerChat();
+  if (!owner) return;
+  const info = await getCreditInfo();
+  if (info) {
+    const remaining = info.remaining;
     const low = remaining < config.creditAlertUsd;
     const alerted = metaGet("credit:lowAlerted") === "1";
 
@@ -481,7 +499,5 @@ export async function checkCredit(): Promise<void> {
     } else if (!low && alerted) {
       metaSet("credit:lowAlerted", "0"); // recharged → re-arm the alert
     }
-  } catch {
-    /* ignore */
   }
 }
