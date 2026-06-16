@@ -222,7 +222,7 @@ async function handleTranscribed(
     case "entries": {
       // Guard against a user resending the same note after a swallowed confirmation failure.
       if (recentDuplicate(String(chatId), transcript)) {
-        await sendText(chatId, "Eso ya lo había anotado hace un ratico 👍 (no lo dupliqué).");
+        await sendText(chatId, "Eso ya lo había anotado hace un momento 👍 (no lo dupliqué).");
         break;
       }
       recordEntries(
