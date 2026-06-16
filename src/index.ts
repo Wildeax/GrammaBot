@@ -126,21 +126,26 @@ async function handleTranscribed(
     transcript = typedText ?? "";
   }
   if (!transcript) return;
+  console.log(`transcript (chat ${chatId}): ${transcript}`);
 
   const action = await interpret(transcript, today());
 
   switch (action.intent) {
-    case "entry": {
-      const e = action.entry;
-      insertEntry({ chatId: String(chatId), rawTranscript: transcript, ...e });
-      const sign = e.direction === "income" ? "Ingreso" : "Gasto";
-      await sendText(
-        chatId,
-        `✅ Anotado: ${sign} de ${fmtMoney(e.amount, e.currency)}` +
+    case "entries": {
+      const lines = action.entries.map((e) => {
+        insertEntry({ chatId: String(chatId), rawTranscript: transcript, ...e });
+        const icon = e.direction === "income" ? "🟢 Ingreso" : "🔴 Gasto";
+        return (
+          `${icon} de ${fmtMoney(e.amount, e.currency)}` +
           (e.category ? ` (${e.category})` : "") +
-          (e.counterparty ? ` — ${e.counterparty}` : "") +
-          `\n📅 ${e.occurredOn}`
-      );
+          (e.counterparty ? ` — ${e.counterparty}` : "")
+        );
+      });
+      const header =
+        action.entries.length > 1
+          ? `✅ Anoté ${action.entries.length} movimientos:`
+          : "✅ Anotado:";
+      await sendText(chatId, `${header}\n${lines.join("\n")}`);
       break;
     }
     case "summary":
