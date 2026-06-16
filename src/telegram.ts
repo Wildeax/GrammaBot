@@ -138,12 +138,12 @@ export async function sendDocument(
   chatId: number,
   filename: string,
   content: string | Uint8Array,
-  mimeType = "text/csv"
+  mimeType = "application/octet-stream"
 ): Promise<void> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  const part = typeof content === "string" ? content : new Uint8Array(content);
-  form.append("document", new Blob([part], { type: mimeType }), filename);
+  // Blob accepts a string or Uint8Array at runtime; cast around the lib's strict BlobPart type.
+  form.append("document", new Blob([content as unknown as BlobPart], { type: mimeType }), filename);
 
   const res = await fetch(`${apiUrl}/sendDocument`, {
     method: "POST",

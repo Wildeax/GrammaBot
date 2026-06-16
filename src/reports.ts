@@ -12,7 +12,14 @@ import {
   type LedgerEntry,
 } from "./db.js";
 import { sendText } from "./telegram.js";
-import { localToday, localHour, localWeekday, previousMonthRange, last7DaysRange } from "./time.js";
+import {
+  localToday,
+  localHour,
+  localWeekday,
+  previousMonthRange,
+  last7DaysRange,
+  currentWeekMonday,
+} from "./time.js";
 
 interface Agg {
   income: number;
@@ -146,7 +153,23 @@ export async function buildWorkbook(chatId: string): Promise<Uint8Array> {
   return (await wb.xlsx.writeBuffer()) as unknown as Uint8Array;
 }
 
-/** Monthly close on the 1st (3-day grace) and a weekly summary on Mondays. Deduped via meta. */
+/**
+ * Send one report to one chat, deduped by `key`. The key is marked done whether the send
+ * succeeds OR fails, so a permanently-failing recipient (e.g. blocked the bot) never becomes a
+ * poison pill that suppresses everyone else. A per-chat try/catch isolates failures.
+ */
+async function sendReport(chat: string, key: string, text: string | null): Promise<void> {
+  if (metaGet(key)) return;
+  try {
+    if (text) await sendText(Number(chat), text);
+  } catch (e) {
+    console.error(`scheduled report to ${chat} failed:`, e);
+  } finally {
+    metaSet(key, "1");
+  }
+}
+
+/** Monthly close on the 1st (3-day grace) and a weekly summary (Mon–Wed grace). Deduped via meta. */
 export async function runScheduledReports(): Promise<void> {
   if (localHour() < config.reportHour) return;
   const day = Number(localToday().slice(8, 10));
@@ -155,22 +178,18 @@ export async function runScheduledReports(): Promise<void> {
   if (day <= 3) {
     const { from, to, label } = previousMonthRange();
     for (const chat of chats) {
-      const key = `rep:m:${chat}:${from}`;
-      if (metaGet(key)) continue;
       const text = buildSummaryText(chat, from, to, `Cierre de ${label}`);
-      if (text) await sendText(Number(chat), `🗓️ ${text}`);
-      metaSet(key, "1");
+      await sendReport(chat, `rep:m:${chat}:${from}`, text ? `🗓️ ${text}` : null);
     }
   }
 
-  if (config.weeklySummary && localWeekday() === 1) {
+  // Weekly: send Mon–Wed (grace if the bot was down on Monday), deduped by the week's Monday.
+  if (config.weeklySummary && localWeekday() >= 1 && localWeekday() <= 3) {
+    const monday = currentWeekMonday();
     const { from, to, label } = last7DaysRange();
     for (const chat of chats) {
-      const key = `rep:w:${chat}:${to}`;
-      if (metaGet(key)) continue;
       const text = buildSummaryText(chat, from, to, `Resumen de ${label}`);
-      if (text) await sendText(Number(chat), text);
-      metaSet(key, "1");
+      await sendReport(chat, `rep:w:${chat}:${monday}`, text);
     }
   }
 }

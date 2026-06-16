@@ -375,26 +375,32 @@ async function handleExport(chatId: number): Promise<void> {
 async function handleCallback(cq: CallbackQuery): Promise<void> {
   const chatId = cq.message?.chat.id;
   const data = cq.data ?? "";
-  if (chatId === undefined) {
-    await answerCallbackQuery(cq.id);
-    return;
-  }
-  if (!isAllowed(chatId)) {
-    await answerCallbackQuery(cq.id, "Privado 🔒");
-    return;
-  }
-  if (data.startsWith("undo:")) {
-    const mid = Number(data.slice(5));
-    const removed = deleteBatchByMessage(String(chatId), mid);
-    await answerCallbackQuery(cq.id, removed.length ? "Deshecho" : "Ya no estaba");
-    if (cq.message) await clearButtons(chatId, cq.message.message_id);
-    if (removed.length) {
-      const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
-      await sendText(chatId, `🗑️ Deshice:\n\n${blocks}`);
+  // Never let a callback throw out of the poll loop (would freeze the bot for everyone).
+  try {
+    if (chatId === undefined) {
+      await answerCallbackQuery(cq.id);
+      return;
     }
-    return;
+    if (!isAllowed(chatId)) {
+      await answerCallbackQuery(cq.id, "Privado 🔒");
+      return;
+    }
+    if (data.startsWith("undo:")) {
+      const mid = Number(data.slice(5));
+      const removed = deleteBatchByMessage(String(chatId), mid);
+      await answerCallbackQuery(cq.id, removed.length ? "Deshecho" : "Ya no estaba");
+      if (cq.message) await clearButtons(chatId, cq.message.message_id);
+      if (removed.length) {
+        const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
+        await sendText(chatId, `🗑️ Deshice:\n\n${blocks}`);
+      }
+      return;
+    }
+    await answerCallbackQuery(cq.id);
+  } catch (err) {
+    console.error("callback error:", err);
+    await answerCallbackQuery(cq.id).catch(() => {});
   }
-  await answerCallbackQuery(cq.id);
 }
 
 const COMMANDS = [
@@ -420,10 +426,20 @@ async function main(): Promise<void> {
   await setMyCommands(COMMANDS).catch((e) => console.error("setMyCommands failed:", e));
 
   // Scheduled reports + credit alerts: check every 30 min (and once now).
-  const tick = () =>
-    Promise.all([runScheduledReports(), checkCredit()]).catch((e) =>
-      console.error("scheduler error:", e)
-    );
+  // An in-flight guard prevents overlapping ticks (which could double-send a report).
+  let ticking = false;
+  const tick = async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      await runScheduledReports();
+      await checkCredit();
+    } catch (e) {
+      console.error("scheduler error:", e);
+    } finally {
+      ticking = false;
+    }
+  };
   setInterval(tick, 30 * 60 * 1000);
   void tick();
 

@@ -59,3 +59,12 @@ export function last7DaysRange(): { from: string; to: string; label: string } {
   d.setUTCDate(d.getUTCDate() - 6);
   return { from: d.toISOString().slice(0, 10), to, label: "los últimos 7 días" };
 }
+
+/** Date (YYYY-MM-DD) of the Monday of the current local week — a stable weekly dedup anchor. */
+export function currentWeekMonday(): string {
+  const wd = localWeekday(); // 0=Sun … 6=Sat
+  const offset = wd === 0 ? 6 : wd - 1; // days since Monday
+  const d = new Date(`${localToday()}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() - offset);
+  return d.toISOString().slice(0, 10);
+}
