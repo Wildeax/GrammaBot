@@ -12,6 +12,7 @@ import {
   setMyCommands,
   type TelegramMessage,
   type CallbackQuery,
+  type InlineButton,
 } from "./telegram.js";
 import { transcribe } from "./transcribe.js";
 import { interpret, InterpretError } from "./extract.js";
@@ -94,6 +95,34 @@ function renderEntry(e: EntryFields): string {
   }
   if (e.counterparty) detail.push(`👤 ${e.counterparty}`);
   return `${fmtDate(e.occurredOn)} · ${money}\n${detail.join(" · ")}`.trim();
+}
+
+// --- conversation memory --------------------------------------------------
+// Short per-chat history so the bot understands follow-ups ("ese gasto", "el resumen",
+// "el de preparación no estaba incluido"). In-memory; a restart simply starts fresh.
+
+interface Turn {
+  role: "user" | "assistant";
+  content: string;
+}
+const histories = new Map<string, Turn[]>();
+function getHistory(chatId: number): Turn[] {
+  return histories.get(String(chatId)) ?? [];
+}
+function recordTurn(chatId: number, role: "user" | "assistant", content: string): void {
+  if (!content) return;
+  const arr = histories.get(String(chatId)) ?? [];
+  arr.push({ role, content: content.slice(0, 600) });
+  while (arr.length > 8) arr.shift(); // keep ~4 exchanges
+  histories.set(String(chatId), arr);
+}
+
+// When `capture` is active, replies are also collected so they can be saved as the
+// assistant's turn in the conversation history.
+let capture: string[] | null = null;
+async function say(chatId: number, text: string, buttons?: InlineButton[]): Promise<void> {
+  if (capture) capture.push(text);
+  await sendText(chatId, text, buttons);
 }
 
 // --- access control -------------------------------------------------------
@@ -212,9 +241,10 @@ async function handleTranscribed(
     return;
   }
 
+  const history = getHistory(chatId);
   let action;
   try {
-    action = await interpret(transcript, localToday());
+    action = await interpret(transcript, localToday(), history);
   } catch (err) {
     if (err instanceof InterpretError) {
       recordFailed(String(chatId), messageId, transcript, err.message);
@@ -228,11 +258,28 @@ async function handleTranscribed(
     throw err;
   }
 
+  capture = [];
+  try {
+    await dispatch(ctx, transcript, action, history);
+  } finally {
+    recordTurn(chatId, "user", transcript);
+    recordTurn(chatId, "assistant", (capture ?? []).join("\n"));
+    capture = null;
+  }
+}
+
+async function dispatch(
+  ctx: Ctx,
+  transcript: string,
+  action: Awaited<ReturnType<typeof interpret>>,
+  history: Turn[]
+): Promise<void> {
+  const { chatId, messageId } = ctx;
   switch (action.intent) {
     case "entries": {
       // Guard against a user resending the same note after a swallowed confirmation failure.
       if (recentDuplicate(String(chatId), transcript)) {
-        await sendText(chatId, "Eso ya lo había anotado hace un momento 👍 (no lo dupliqué).");
+        await say(chatId, "Eso ya lo había anotado hace un momento 👍 (no lo dupliqué).");
         break;
       }
       recordEntries(
@@ -254,7 +301,7 @@ async function handleTranscribed(
           ? `\n\n⏳ ${pendingCount} sin monto. Cuando sepas cuánto fue, decime "lo de … fueron …".`
           : "";
       // Undo button tied to THIS message's batch (so it works even after later entries).
-      await sendText(chatId, `${header}\n\n${blocks}${footer}`, [
+      await say(chatId, `${header}\n\n${blocks}${footer}`, [
         { text: "↩️ Deshacer", callback_data: `undo:${messageId}` },
       ]);
       break;
@@ -262,9 +309,9 @@ async function handleTranscribed(
     case "edit_last": {
       const updated = editLast(String(chatId), action.changes);
       if (!updated) {
-        await sendText(chatId, "No hay ninguna anotación reciente para corregir.");
+        await say(chatId, "No hay ninguna anotación reciente para corregir.");
       } else {
-        await sendText(chatId, `✏️ Corregí la última anotación:\n\n${renderEntry(updated)}`);
+        await say(chatId, `✏️ Corregí la última anotación:\n\n${renderEntry(updated)}`);
       }
       break;
     }
@@ -274,14 +321,14 @@ async function handleTranscribed(
         which: action.which,
       });
       if (!r.completed) {
-        await sendText(
+        await say(
           chatId,
           r.hadPending
             ? 'No supe cuál pendiente completar. Mirá /pendientes y decime "completá el N con MONTO".'
             : "No tenés trabajos pendientes para completar 👍"
         );
       } else {
-        await sendText(chatId, `✅ Completé el pendiente:\n\n${renderEntry(r.completed)}`);
+        await say(chatId, `✅ Completé el pendiente:\n\n${renderEntry(r.completed)}`);
       }
       break;
     }
@@ -289,7 +336,7 @@ async function handleTranscribed(
       await handleSummary(chatId, action.from, action.to, action.label);
       break;
     case "search":
-      await handleSearch(chatId, action, transcript);
+      await handleSearch(chatId, action, transcript, history);
       break;
     case "delete_last":
       await handleDeleteLast(chatId);
@@ -298,17 +345,17 @@ async function handleTranscribed(
       await handleExport(chatId, action.format);
       break;
     case "help":
-      await sendText(chatId, WELCOME);
+      await say(chatId, WELCOME);
       break;
     case "chat":
-      await sendText(
+      await say(
         chatId,
         action.reply ||
           "¡Hola! 🙂 Contame qué gastaste o qué te entró y lo anoto. Por ejemplo: \"pagué 50 mil al jornalero\"."
       );
       break;
     case "none":
-      await sendText(
+      await say(
         chatId,
         "Perdoná, no te entendí bien 🙂\n" +
           'Contame un gasto o ingreso (ej: "pagué 50 mil al jornalero"), pedime un resumen ' +
@@ -326,20 +373,21 @@ async function handleSummary(
 ): Promise<void> {
   const text = buildSummaryText(String(chatId), from, to, `Resumen — ${label}`);
   if (!text) {
-    await sendText(chatId, `No tengo anotaciones de ${label}.`);
+    await say(chatId, `No tengo anotaciones de ${label}.`);
     return;
   }
-  await sendText(chatId, text);
+  await say(chatId, text);
 }
 
 async function handleSearch(
   chatId: number,
   filters: { text: string | null; counterparty: string | null; from: string | null; to: string | null; label: string },
-  question = ""
+  question = "",
+  history: Turn[] = []
 ): Promise<void> {
   const results = searchEntries(String(chatId), filters);
   if (results.length === 0) {
-    await sendText(chatId, `No encontré nada sobre ${filters.label}.`);
+    await say(chatId, `No encontré nada sobre ${filters.label}.`);
     return;
   }
   // Expense totals per currency (never mix currencies into one number).
@@ -360,18 +408,18 @@ async function handleSearch(
 
   // Answer the question in words first (explaining e.g. that a gasto is from another month),
   // then show the detail below. Falls back to just the detail if the answer can't be composed.
-  const answer = question ? await composeAnswer(question, results, localToday()) : null;
-  await sendText(chatId, answer ? `${answer}\n\n———\n${detail}` : detail);
+  const answer = question ? await composeAnswer(question, results, localToday(), history) : null;
+  await say(chatId, answer ? `${answer}\n\n———\n${detail}` : detail);
 }
 
 async function handlePending(chatId: number): Promise<void> {
   const items = pendingEntries(String(chatId));
   if (items.length === 0) {
-    await sendText(chatId, "No tenés trabajos pendientes de monto 👍");
+    await say(chatId, "No tenés trabajos pendientes de monto 👍");
     return;
   }
   const blocks = items.map((e, i) => `${i + 1}. ${renderEntry(e)}`).join("\n\n");
-  await sendText(
+  await say(
     chatId,
     `⏳ ${items.length} sin monto:\n\n${blocks}\n\n` +
       'Para completar uno, decime el monto (ej: "lo de Wilfer fueron 100 mil" o "completá el 2 con 100 mil").'
@@ -381,12 +429,12 @@ async function handlePending(chatId: number): Promise<void> {
 async function handleDeleteLast(chatId: number): Promise<void> {
   const removed = deleteLastBatch(String(chatId));
   if (removed.length === 0) {
-    await sendText(chatId, "No hay nada para borrar.");
+    await say(chatId, "No hay nada para borrar.");
     return;
   }
   const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
   const header = removed.length > 1 ? `🗑️ Borré las últimas ${removed.length} anotaciones:` : "🗑️ Borré la última anotación:";
-  await sendText(chatId, `${header}\n\n${blocks}`);
+  await say(chatId, `${header}\n\n${blocks}`);
 }
 
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -395,12 +443,12 @@ async function handleExport(chatId: number, format: "pdf" | "excel" = "excel"): 
   if (format === "pdf") {
     const buffer = await buildPdf(String(chatId));
     await sendDocument(chatId, `cuentas-${localToday()}.pdf`, buffer, "application/pdf");
-    await sendText(chatId, "📄 Listo, te mandé tus cuentas en PDF.");
+    await say(chatId, "📄 Listo, te mandé tus cuentas en PDF.");
     return;
   }
   const buffer = await buildWorkbook(String(chatId));
   await sendDocument(chatId, `cuentas-${localToday()}.xlsx`, buffer, XLSX_MIME);
-  await sendText(chatId, "📊 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
+  await say(chatId, "📊 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
 }
 
 // Handle a tap on an inline button (currently only "↩️ Deshacer").

@@ -182,9 +182,10 @@ export function buildPdf(chatId: string): Promise<Uint8Array> {
   const entries = allEntries(chatId);
   const doc = new PDFDocument({ size: "A4", margin: PDF.margin, bufferPages: true });
   const chunks: Buffer[] = [];
-  const done = new Promise<Uint8Array>((resolve) => {
+  const done = new Promise<Uint8Array>((resolve, reject) => {
     doc.on("data", (c: Buffer) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks) as unknown as Uint8Array));
+    doc.on("error", reject); // so a stream error rejects instead of hanging the await
   });
 
   const M = PDF.margin;
@@ -230,10 +231,15 @@ export function buildPdf(chatId: string): Promise<Uint8Array> {
   };
 
   // --- Summary cards ---
-  if (byCur.size === 0) {
+  if (entries.length === 0) {
     doc.fillColor(PDF.muted).font("Helvetica").fontSize(11).text("Todavía no hay movimientos registrados.", M, y);
     doc.end();
     return done;
+  }
+  // Pending-only ledger: no recorded totals, but still list the movements below.
+  if (byCur.size === 0) {
+    doc.fillColor(PDF.muted).font("Helvetica").fontSize(11).text("Sin montos registrados todavía (hay pendientes).", M, y);
+    y = doc.y + 14;
   }
 
   const card = (x: number, w: number, label: string, value: string, color: string) => {
@@ -377,7 +383,8 @@ async function sendReport(chat: string, key: string, text: string | null): Promi
 export async function composeAnswer(
   question: string,
   entries: LedgerEntry[],
-  today: string
+  today: string,
+  history: { role: "user" | "assistant"; content: string }[] = []
 ): Promise<string | null> {
   if (!config.llm.apiKey) return null;
   const lines = entries
@@ -407,6 +414,7 @@ export async function composeAnswer(
         max_tokens: 220,
         messages: [
           { role: "system", content: system },
+          ...history,
           { role: "user", content: `Hoy: ${today}\nPregunta: ${question}\nMovimientos encontrados:\n${lines}` },
         ],
       }),
