@@ -137,6 +137,14 @@ const sumText = reports.buildSummaryText(CHAT4, "0000-01-01", today, "Test");
 check("buildSummaryText returns text", typeof sumText === "string" && sumText.includes("Gastos"), String(sumText).slice(0, 60));
 const wb = await reports.buildWorkbook(CHAT4);
 check("buildWorkbook returns bytes", wb && wb.length > 1000, `len=${wb && wb.length}`);
+const pdf = await reports.buildPdf(CHAT4);
+const pdfHeader = Buffer.from(pdf.slice(0, 5)).toString("latin1");
+check("buildPdf returns a valid PDF", pdfHeader === "%PDF-" && pdf.length > 500, `header=${pdfHeader} len=${pdf.length}`);
+
+const aPdf = await interpret("dame el resumen en pdf", today);
+check("export intent format=pdf", aPdf.intent === "export" && aPdf.format === "pdf", JSON.stringify(aPdf));
+const aXls = await interpret("pasame el excel de mis cuentas", today);
+check("export intent format=excel", aXls.intent === "export" && aXls.format === "excel", JSON.stringify(aXls));
 
 const time = await import("../dist/time.js");
 const pm = time.previousMonthRange();

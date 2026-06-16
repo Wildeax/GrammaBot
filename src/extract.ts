@@ -19,7 +19,7 @@ export type Action =
       label: string;
     }
   | { intent: "delete_last" }
-  | { intent: "export" }
+  | { intent: "export"; format: "pdf" | "excel" }
   | { intent: "help" }
   | { intent: "chat"; reply: string }
   | { intent: "none" };
@@ -72,7 +72,8 @@ La moneda SIEMPRE es COP salvo que diga explícitamente otra.
 5) "delete_last" — borrar/deshacer la última anotación ("borrá lo último", "me equivoqué").
 
 5b) "export" — pide descargar/exportar sus cuentas o tenerlas en un archivo ("dame el resumen
-   en pdf", "exportá todo", "mandame el archivo", "pasame el Excel").
+   en pdf", "exportá todo", "mandame el archivo", "pasame el Excel"). Incluí "format": "pdf" si
+   pide PDF, o "excel" en cualquier otro caso.
 
 6) "edit_last" — corregir la ÚLTIMA anotación ("cambiá el monto del último a 200 mil", "el gas
    fue 6 mil no 5", "cambiá la fecha a ayer", "ponele que fue de Danilo", "esa categoría es insumos").
@@ -115,6 +116,7 @@ interface RawAction extends RawEntry {
   label?: string;
   which?: number | string | null;
   reply?: string;
+  format?: string;
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -254,7 +256,7 @@ export async function interpret(transcript: string, today: string): Promise<Acti
   }
 
   if (parsed.intent === "export") {
-    return { intent: "export" };
+    return { intent: "export", format: parsed.format === "pdf" ? "pdf" : "excel" };
   }
 
   if (parsed.intent === "help") {

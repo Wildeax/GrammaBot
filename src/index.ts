@@ -18,7 +18,14 @@ import { interpret, InterpretError } from "./extract.js";
 import { guardInput, type GuardCategory } from "./guard.js";
 import { localToday, localMonthStart } from "./time.js";
 import { fmtAmount, fmtMoney, fmtDate } from "./format.js";
-import { buildSummaryText, buildWorkbook, runScheduledReports, checkCredit } from "./reports.js";
+import {
+  buildSummaryText,
+  buildWorkbook,
+  buildPdf,
+  composeAnswer,
+  runScheduledReports,
+  checkCredit,
+} from "./reports.js";
 import {
   recordEntries,
   completePending,
@@ -54,7 +61,8 @@ const WELCOME =
   '• "¿Cuánto le pagué a Danilo?" — buscar movimientos\n' +
   '• "Lo de Wilfer fueron 100 mil" — completar un pendiente\n' +
   '• "Borrá lo último" — si te equivocaste\n' +
-  "• /pendientes — trabajos sin monto · /exportar — bajar todo en Excel\n\n" +
+  "• /pendientes — trabajos sin monto\n" +
+  "• /exportar — bajar todo en Excel · /pdf — bajar todo en PDF\n\n" +
   "Esto es privado: solo vos ves tus cuentas. Mandame una nota de voz cuando quieras 🙂";
 
 const GUARD_REPLIES: Record<GuardCategory, string> = {
@@ -139,8 +147,10 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
     const lower = text.toLowerCase();
     if (lower.startsWith("/start") || lower.startsWith("/help") || lower.startsWith("/ayuda")) {
       await sendText(chatId, WELCOME);
+    } else if (lower.startsWith("/pdf")) {
+      await handleExport(chatId, "pdf");
     } else if (lower.startsWith("/export") || lower.startsWith("/exportar")) {
-      await handleExport(chatId);
+      await handleExport(chatId, "excel");
     } else if (lower.startsWith("/pendientes")) {
       await handlePending(chatId);
     } else if (lower.startsWith("/resumen")) {
@@ -279,13 +289,13 @@ async function handleTranscribed(
       await handleSummary(chatId, action.from, action.to, action.label);
       break;
     case "search":
-      await handleSearch(chatId, action);
+      await handleSearch(chatId, action, transcript);
       break;
     case "delete_last":
       await handleDeleteLast(chatId);
       break;
     case "export":
-      await handleExport(chatId);
+      await handleExport(chatId, action.format);
       break;
     case "help":
       await sendText(chatId, WELCOME);
@@ -324,7 +334,8 @@ async function handleSummary(
 
 async function handleSearch(
   chatId: number,
-  filters: { text: string | null; counterparty: string | null; from: string | null; to: string | null; label: string }
+  filters: { text: string | null; counterparty: string | null; from: string | null; to: string | null; label: string },
+  question = ""
 ): Promise<void> {
   const results = searchEntries(String(chatId), filters);
   if (results.length === 0) {
@@ -344,11 +355,13 @@ async function handleSearch(
     .map(([cur, v]) => `Total gastos: ${fmtMoney(v, cur)}`)
     .join("\n");
   const blocks = results.map((e) => renderEntry(e)).join("\n\n");
-  await sendText(
-    chatId,
-    `🔎 ${filters.label} — ${results.length} resultado(s):\n\n${blocks}` +
-      (totalsLines ? `\n\n${totalsLines}` : "")
-  );
+  const detail = `🔎 ${filters.label} — ${results.length} resultado(s):\n\n${blocks}` +
+    (totalsLines ? `\n\n${totalsLines}` : "");
+
+  // Answer the question in words first (explaining e.g. that a gasto is from another month),
+  // then show the detail below. Falls back to just the detail if the answer can't be composed.
+  const answer = question ? await composeAnswer(question, results, localToday()) : null;
+  await sendText(chatId, answer ? `${answer}\n\n———\n${detail}` : detail);
 }
 
 async function handlePending(chatId: number): Promise<void> {
@@ -378,10 +391,16 @@ async function handleDeleteLast(chatId: number): Promise<void> {
 
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
-async function handleExport(chatId: number): Promise<void> {
+async function handleExport(chatId: number, format: "pdf" | "excel" = "excel"): Promise<void> {
+  if (format === "pdf") {
+    const buffer = await buildPdf(String(chatId));
+    await sendDocument(chatId, `cuentas-${localToday()}.pdf`, buffer, "application/pdf");
+    await sendText(chatId, "📄 Listo, te mandé tus cuentas en PDF.");
+    return;
+  }
   const buffer = await buildWorkbook(String(chatId));
   await sendDocument(chatId, `cuentas-${localToday()}.xlsx`, buffer, XLSX_MIME);
-  await sendText(chatId, "📄 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
+  await sendText(chatId, "📊 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
 }
 
 // Handle a tap on an inline button (currently only "↩️ Deshacer").
@@ -420,6 +439,7 @@ const COMMANDS = [
   { command: "resumen", description: "Resumen de este mes" },
   { command: "pendientes", description: "Trabajos sin monto" },
   { command: "exportar", description: "Bajar todo en Excel" },
+  { command: "pdf", description: "Bajar todo en PDF" },
   { command: "ayuda", description: "Cómo usar el bot" },
 ];
 
