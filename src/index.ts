@@ -351,7 +351,7 @@ async function dispatch(
       await say(
         chatId,
         action.reply ||
-          "¡Hola! 🙂 Contame qué gastaste o qué te entró y lo anoto. Por ejemplo: \"pagué 50 mil al jornalero\"."
+          "Contame qué gastaste o qué te entró y lo anoto 🙂. Por ejemplo: \"pagué 50 mil al jornalero\"."
       );
       break;
     case "none":
