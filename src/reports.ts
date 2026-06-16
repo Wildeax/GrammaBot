@@ -9,6 +9,7 @@ import {
   allEntries,
   distinctChatIds,
   hasEntriesOutside,
+  getBookName,
   metaGet,
   metaSet,
   type LedgerEntry,
@@ -87,8 +88,10 @@ export function buildSummaryText(
 /** Build a formatted .xlsx workbook (Movimientos + Resumen) for a chat. */
 export async function buildWorkbook(chatId: string): Promise<Uint8Array> {
   const entries = allEntries(chatId);
+  const bookTitle = getBookName(chatId) || "Cuentas de la finca";
   const wb = new ExcelJS.Workbook();
   wb.creator = "GrammaBot";
+  wb.title = bookTitle;
 
   const mov = wb.addWorksheet("Movimientos");
   mov.columns = [
@@ -121,10 +124,14 @@ export async function buildWorkbook(chatId: string): Promise<Uint8Array> {
       nota: e.note ?? "",
     });
   }
-  mov.getRow(1).font = { bold: true };
   mov.getColumn("monto").numFmt = "#,##0";
   mov.getColumn("precio").numFmt = "#,##0";
-  mov.views = [{ state: "frozen", ySplit: 1 }];
+  // Title row at the top (pushes the header to row 2).
+  mov.spliceRows(1, 0, [bookTitle]);
+  mov.mergeCells(1, 1, 1, 12);
+  mov.getRow(1).font = { bold: true, size: 14 };
+  mov.getRow(2).font = { bold: true };
+  mov.views = [{ state: "frozen", ySplit: 2 }];
 
   // Resumen sheet: totals per currency + by category.
   const res = wb.addWorksheet("Resumen");
@@ -166,15 +173,15 @@ const PDF = {
   pageW: 595.28,
   pageH: 841.89,
   margin: 40,
-  brand: "#15663f",
-  brandSoft: "#e8f1ec",
-  income: "#2e7d32",
-  expense: "#c62828",
-  pending: "#b26a00",
-  ink: "#222222",
+  brand: "#2f6f57", // calm forest green
+  brandSoft: "#eaf3ee",
+  income: "#2e8b57", // sea green
+  expense: "#b5654a", // muted terracotta — clearly "salida" but not alarming
+  pending: "#b8860b", // amber
+  ink: "#2b2b2b",
   muted: "#7a7a7a",
-  rowAlt: "#f6f8f7",
-  border: "#e3e6e4",
+  rowAlt: "#f5f8f6",
+  border: "#e4e8e5",
 };
 
 /** Build a polished PDF report (header, summary cards, category bars, movements table). */
@@ -222,7 +229,8 @@ export function buildPdf(chatId: string): Promise<Uint8Array> {
     byCur.set(cur, a);
   }
 
-  bandTitle("Cuentas de la finca", 92);
+  const bookTitle = getBookName(chatId) || "Cuentas de la finca";
+  bandTitle(bookTitle, 92);
 
   const sectionTitle = (t: string) => {
     doc.fillColor(PDF.brand).font("Helvetica-Bold").fontSize(13).text(t, M, y);
@@ -317,7 +325,7 @@ export function buildPdf(chatId: string): Promise<Uint8Array> {
     if (y + rowH > BOTTOM) {
       doc.addPage();
       y = 0;
-      bandTitle("Cuentas de la finca — Movimientos", 40);
+      bandTitle(`${bookTitle} — Movimientos`, 40);
       tableHeader();
       doc.font("Helvetica").fontSize(9.5);
     }

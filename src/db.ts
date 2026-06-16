@@ -188,6 +188,20 @@ export function setOffset(offset: number): void {
   metaSet("offset", String(offset));
 }
 
+// --- book name (per chat; one active book for now, extensible to multiple later) ---
+export function getBookName(chatId: string): string | null {
+  return metaGet(`book:${chatId}`);
+}
+export function setBookName(chatId: string, name: string): void {
+  metaSet(`book:${chatId}`, name);
+}
+export function isAwaitingBookName(chatId: string): boolean {
+  return metaGet(`awaitbook:${chatId}`) === "1";
+}
+export function setAwaitingBookName(chatId: string, v: boolean): void {
+  metaSet(`awaitbook:${chatId}`, v ? "1" : "0");
+}
+
 /** Distinct chats that have at least one (non-deleted) entry — used for scheduled reports. */
 export function distinctChatIds(): string[] {
   return (

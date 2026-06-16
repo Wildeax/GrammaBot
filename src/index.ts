@@ -42,6 +42,10 @@ import {
   getOffset,
   setOffset,
   recordFailed,
+  getBookName,
+  setBookName,
+  isAwaitingBookName,
+  setAwaitingBookName,
   type EntryFields,
 } from "./db.js";
 
@@ -174,8 +178,36 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
       authorName: msg.from?.first_name ?? msg.from?.username ?? null,
     };
 
+    // If we just asked for the book name, capture the next plain-text reply as the name.
+    if (isAwaitingBookName(String(chatId))) {
+      if (text && !text.startsWith("/")) {
+        const name = text.replace(/\s+/g, " ").trim().slice(0, 60);
+        setBookName(String(chatId), name);
+        setAwaitingBookName(String(chatId), false);
+        await sendText(
+          chatId,
+          `¡Listo! Tu cuaderno se llama «${name}» 📒\n\n` +
+            'Contame tu primer gasto o ingreso, por ejemplo: "pagué 50 mil al jornalero".'
+        );
+        return;
+      }
+      setAwaitingBookName(String(chatId), false); // they did something else; stop waiting
+    }
+
     const lower = text.toLowerCase();
-    if (lower.startsWith("/start") || lower.startsWith("/help") || lower.startsWith("/ayuda")) {
+    if (lower.startsWith("/start")) {
+      if (!getBookName(String(chatId))) {
+        setAwaitingBookName(String(chatId), true);
+        await sendText(
+          chatId,
+          "¡Hola! 🧾 Soy tu asistente de cuentas.\n\n" +
+            "Primero, ¿cómo querés que se llame tu cuaderno de cuentas? " +
+            '(por ejemplo: "Finca La Esperanza" o "Cuentas de la casa"). Escribime el nombre 🙂'
+        );
+      } else {
+        await sendText(chatId, `📒 Cuaderno: ${getBookName(String(chatId))}\n\n${WELCOME}`);
+      }
+    } else if (lower.startsWith("/help") || lower.startsWith("/ayuda")) {
       await sendText(chatId, WELCOME);
     } else if (lower.startsWith("/creditos") || lower.startsWith("/crédito") || lower.startsWith("/credito") || lower.startsWith("/saldo")) {
       await handleCredit(chatId);
@@ -462,15 +494,30 @@ async function handleCredit(chatId: number): Promise<void> {
 
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
+/** Filename-safe slug from the book name (accents stripped, spaces → dashes). */
+function bookSlug(chatId: number): string {
+  const name = getBookName(String(chatId)) || "cuentas";
+  return (
+    name
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 40) || "cuentas"
+  );
+}
+
 async function handleExport(chatId: number, format: "pdf" | "excel" = "excel"): Promise<void> {
+  const base = `${bookSlug(chatId)}-${localToday()}`;
   if (format === "pdf") {
     const buffer = await buildPdf(String(chatId));
-    await sendDocument(chatId, `cuentas-${localToday()}.pdf`, buffer, "application/pdf");
+    await sendDocument(chatId, `${base}.pdf`, buffer, "application/pdf");
     await say(chatId, "📄 Listo, te mandé tus cuentas en PDF.");
     return;
   }
   const buffer = await buildWorkbook(String(chatId));
-  await sendDocument(chatId, `cuentas-${localToday()}.xlsx`, buffer, XLSX_MIME);
+  await sendDocument(chatId, `${base}.xlsx`, buffer, XLSX_MIME);
   await say(chatId, "📊 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
 }
 
