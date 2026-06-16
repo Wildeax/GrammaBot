@@ -154,25 +154,53 @@ export async function buildWorkbook(chatId: string): Promise<Uint8Array> {
   return (await wb.xlsx.writeBuffer()) as unknown as Uint8Array;
 }
 
-/** Build a formatted PDF report (summary + movements table) for a chat. */
+// --- PDF design system -----------------------------------------------------
+const PDF = {
+  pageW: 595.28,
+  pageH: 841.89,
+  margin: 40,
+  brand: "#15663f",
+  brandSoft: "#e8f1ec",
+  income: "#2e7d32",
+  expense: "#c62828",
+  pending: "#b26a00",
+  ink: "#222222",
+  muted: "#7a7a7a",
+  rowAlt: "#f6f8f7",
+  border: "#e3e6e4",
+};
+
+/** Build a polished PDF report (header, summary cards, category bars, movements table). */
 export function buildPdf(chatId: string): Promise<Uint8Array> {
   const entries = allEntries(chatId);
-  const doc = new PDFDocument({ size: "A4", margin: 40 });
+  const doc = new PDFDocument({ size: "A4", margin: PDF.margin, bufferPages: true });
   const chunks: Buffer[] = [];
   const done = new Promise<Uint8Array>((resolve) => {
     doc.on("data", (c: Buffer) => chunks.push(c));
     doc.on("end", () => resolve(Buffer.concat(chunks) as unknown as Uint8Array));
   });
 
-  const PAGE_BOTTOM = 800;
-  const left = 40;
+  const M = PDF.margin;
+  const RIGHT = PDF.pageW - M;
+  const contentW = PDF.pageW - 2 * M;
+  const BOTTOM = PDF.pageH - 48; // keep clear of the footer
+  let y = 0;
 
-  doc.fontSize(18).font("Helvetica-Bold").text("Cuentas — GrammaBot");
-  doc.moveDown(0.2);
-  doc.fontSize(10).font("Helvetica").fillColor("#666").text(`Generado: ${fmtDate(localToday())}`);
-  doc.fillColor("#000").moveDown(0.8);
+  const bandTitle = (title: string, height: number) => {
+    doc.rect(0, 0, PDF.pageW, height).fill(PDF.brand);
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(height > 60 ? 22 : 14).text(title, M, height > 60 ? 28 : 12);
+    if (height > 60) {
+      doc
+        .font("Helvetica")
+        .fontSize(10.5)
+        .fillColor("#cfe3d8")
+        .text(`GrammaBot · generado el ${fmtDate(localToday())}`, M, 60);
+    }
+    doc.fillColor(PDF.ink);
+    y = height + 22;
+  };
 
-  // --- Resumen (per currency) ---
+  // --- aggregate per currency ---
   const byCur = new Map<string, Agg>();
   for (const e of entries) {
     if (e.status === "pending") continue;
@@ -185,64 +213,133 @@ export function buildPdf(chatId: string): Promise<Uint8Array> {
     }
     byCur.set(cur, a);
   }
-  doc.fontSize(13).font("Helvetica-Bold").text("Resumen");
-  doc.moveDown(0.3);
+
+  bandTitle("Cuentas de la finca", 92);
+
+  const sectionTitle = (t: string) => {
+    doc.fillColor(PDF.brand).font("Helvetica-Bold").fontSize(13).text(t, M, y);
+    y = doc.y + 6;
+    doc.fillColor(PDF.ink);
+  };
+
+  // --- Summary cards ---
   if (byCur.size === 0) {
-    doc.fontSize(10).font("Helvetica").text("Sin movimientos registrados todavía.");
+    doc.fillColor(PDF.muted).font("Helvetica").fontSize(11).text("Todavía no hay movimientos registrados.", M, y);
+    doc.end();
+    return done;
   }
+
+  const card = (x: number, w: number, label: string, value: string, color: string) => {
+    const h = 64;
+    doc.roundedRect(x, y, w, h, 8).fill(PDF.brandSoft);
+    doc.fillColor(PDF.muted).font("Helvetica-Bold").fontSize(8).text(label, x + 12, y + 13, { width: w - 24 });
+    doc.fillColor(color).font("Helvetica-Bold").fontSize(13).text(value, x + 12, y + 31, { width: w - 24, lineBreak: false });
+    doc.fillColor(PDF.ink);
+  };
+
   for (const [cur, a] of byCur) {
-    doc.fontSize(11).font("Helvetica-Bold").text(cur);
-    doc.fontSize(10).font("Helvetica");
-    doc.text(`  Ingresos: ${fmtMoney(a.income, cur)}`);
-    doc.text(`  Gastos:   ${fmtMoney(a.expense, cur)}`);
-    doc.text(`  Balance:  ${fmtMoney(a.income - a.expense, cur)}`);
-    for (const [cat, amt] of [...a.cats.entries()].sort((x, y) => y[1] - x[1])) {
-      doc.fillColor("#555").text(`     • ${cat}: ${fmtMoney(amt, cur)}`).fillColor("#000");
+    if (byCur.size > 1) {
+      sectionTitle(`Resumen — ${cur}`);
+    } else {
+      sectionTitle("Resumen");
     }
-    doc.moveDown(0.4);
+    const gap = 12;
+    const w = (contentW - 2 * gap) / 3;
+    const top = y;
+    card(M, w, "INGRESOS", fmtMoney(a.income, cur), PDF.income);
+    y = top;
+    card(M + w + gap, w, "GASTOS", fmtMoney(a.expense, cur), PDF.expense);
+    y = top;
+    card(M + 2 * (w + gap), w, "BALANCE", fmtMoney(a.income - a.expense, cur), a.income - a.expense >= 0 ? PDF.income : PDF.expense);
+    y = top + 64 + 18;
+
+    // Category bars
+    const cats = [...a.cats.entries()].sort((x2, y2) => y2[1] - x2[1]).slice(0, 8);
+    if (cats.length) {
+      doc.fillColor(PDF.muted).font("Helvetica-Bold").fontSize(9).text("GASTOS POR CATEGORÍA", M, y);
+      y = doc.y + 6;
+      const max = Math.max(...cats.map(([, v]) => v));
+      const barX = M + 150;
+      const barMax = contentW - 150 - 110;
+      for (const [cat, amt] of cats) {
+        doc.fillColor(PDF.ink).font("Helvetica").fontSize(9.5).text(cat, M, y, { width: 145, lineBreak: false });
+        doc.roundedRect(barX, y + 1, barMax, 9, 2).fill(PDF.border);
+        const wBar = Math.max(3, (amt / max) * barMax);
+        doc.roundedRect(barX, y + 1, wBar, 9, 2).fill(PDF.brand);
+        doc.fillColor(PDF.ink).font("Helvetica").fontSize(9.5).text(fmtMoney(amt, cur), RIGHT - 108, y, { width: 108, align: "right", lineBreak: false });
+        y += 16;
+      }
+      y += 8;
+    }
   }
 
   // --- Movimientos table ---
-  doc.moveDown(0.4).fontSize(13).font("Helvetica-Bold").text("Movimientos");
-  doc.moveDown(0.3);
-
   const cols = [
-    { label: "Fecha", x: left, w: 62 },
-    { label: "Tipo", x: left + 62, w: 42 },
-    { label: "Concepto", x: left + 104, w: 200 },
-    { label: "Monto", x: left + 304, w: 95 },
-    { label: "Quién", x: left + 399, w: 110 },
+    { label: "Fecha", x: M, w: 64, align: "left" as const },
+    { label: "Tipo", x: M + 64, w: 46, align: "left" as const },
+    { label: "Concepto", x: M + 110, w: 210, align: "left" as const },
+    { label: "Monto", x: M + 320, w: 100, align: "right" as const },
+    { label: "Quién", x: M + 425, w: contentW - 425, align: "left" as const },
   ];
-  const drawHeader = () => {
-    doc.fontSize(9).font("Helvetica-Bold");
-    for (const c of cols) doc.text(c.label, c.x, doc.y, { width: c.w, continued: false, lineBreak: false });
-    doc.moveDown(0.2);
-    doc.moveTo(left, doc.y).lineTo(left + 509, doc.y).strokeColor("#ccc").stroke().strokeColor("#000");
-    doc.moveDown(0.15);
+  const tableHeader = () => {
+    doc.rect(M, y, contentW, 20).fill(PDF.brand);
+    doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(9);
+    for (const c of cols) doc.text(c.label, c.x + 4, y + 6, { width: c.w - 8, align: c.align, lineBreak: false });
+    doc.fillColor(PDF.ink);
+    y += 20;
   };
-  drawHeader();
-  doc.fontSize(9).font("Helvetica");
+
+  sectionTitle("Movimientos");
+  tableHeader();
+
+  let alt = false;
+  doc.font("Helvetica").fontSize(9.5);
   for (const e of entries) {
-    if (doc.y > PAGE_BOTTOM) {
+    const concept = e.concept ?? "";
+    const detail =
+      e.quantity && e.unit ? `${e.quantity} ${e.unit}${e.unitPrice ? ` × ${fmtAmount(e.unitPrice)}` : ""}` : "";
+    const conceptH = doc.heightOfString(concept || " ", { width: cols[2].w - 8 });
+    const rowH = Math.max(20, conceptH + (detail ? 11 : 0) + 9);
+
+    if (y + rowH > BOTTOM) {
       doc.addPage();
-      drawHeader();
-      doc.fontSize(9).font("Helvetica");
+      y = 0;
+      bandTitle("Cuentas de la finca — Movimientos", 40);
+      tableHeader();
+      doc.font("Helvetica").fontSize(9.5);
     }
-    const rowY = doc.y;
-    const cells = [
-      fmtDate(e.occurredOn),
-      e.direction === "income" ? "ingreso" : "gasto",
-      e.concept ?? "",
-      e.status === "pending" ? "pendiente" : fmtMoney(e.amount, e.currency),
-      e.counterparty ?? "",
-    ];
-    let maxY = rowY;
-    cells.forEach((text, i) => {
-      doc.text(text, cols[i].x, rowY, { width: cols[i].w });
-      maxY = Math.max(maxY, doc.y);
-    });
-    doc.y = maxY;
-    doc.moveDown(0.25);
+
+    if (alt) doc.rect(M, y, contentW, rowH).fill(PDF.rowAlt).fillColor(PDF.ink);
+    alt = !alt;
+
+    const isIncome = e.direction === "income";
+    const pad = 5;
+    doc.font("Helvetica").fontSize(9.5).fillColor(PDF.ink);
+    doc.text(fmtDate(e.occurredOn), cols[0].x + 4, y + pad, { width: cols[0].w - 8, lineBreak: false });
+    doc.fillColor(isIncome ? PDF.income : PDF.expense).text(isIncome ? "ingreso" : "gasto", cols[1].x + 4, y + pad, { width: cols[1].w - 8, lineBreak: false });
+    doc.fillColor(PDF.ink).text(concept, cols[2].x + 4, y + pad, { width: cols[2].w - 8 });
+    if (detail) doc.fillColor(PDF.muted).fontSize(8).text(detail, cols[2].x + 4, y + pad + conceptH, { width: cols[2].w - 8, lineBreak: false }).fontSize(9.5);
+    if (e.status === "pending") {
+      doc.fillColor(PDF.pending).font("Helvetica-Oblique").text("pendiente", cols[3].x + 4, y + pad, { width: cols[3].w - 8, align: "right", lineBreak: false }).font("Helvetica");
+    } else {
+      doc.fillColor(isIncome ? PDF.income : PDF.expense).font("Helvetica-Bold").text(fmtMoney(e.amount, e.currency), cols[3].x + 4, y + pad, { width: cols[3].w - 8, align: "right", lineBreak: false }).font("Helvetica");
+    }
+    doc.fillColor(PDF.ink).text(e.counterparty ?? "", cols[4].x + 4, y + pad, { width: cols[4].w - 8, lineBreak: false });
+
+    y += rowH;
+    doc.moveTo(M, y).lineTo(RIGHT, y).strokeColor(PDF.border).lineWidth(0.5).stroke();
+  }
+
+  // Footer page numbers.
+  const range = doc.bufferedPageRange();
+  for (let i = 0; i < range.count; i++) {
+    doc.switchToPage(range.start + i);
+    doc.font("Helvetica").fontSize(8).fillColor(PDF.muted).text(
+      `Página ${i + 1} de ${range.count}`,
+      M,
+      PDF.pageH - 30,
+      { width: contentW, align: "center", lineBreak: false }
+    );
   }
 
   doc.end();
