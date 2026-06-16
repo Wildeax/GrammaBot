@@ -5,7 +5,7 @@ import type { LedgerEntry } from "./db.js";
 
 export type ExtractedEntry = Omit<
   LedgerEntry,
-  "id" | "whatsappFrom" | "rawTranscript" | "createdAt"
+  "id" | "chatId" | "rawTranscript" | "createdAt"
 >;
 
 const SYSTEM_PROMPT = `Eres un asistente de contabilidad. Recibes lo que una persona dijo

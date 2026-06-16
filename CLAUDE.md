@@ -7,7 +7,7 @@
 ## What this is
 
 GrammaBot — an AI assistant that lets a non-technical person keep accounting/bookkeeping
-records by sending **WhatsApp voice notes**. The bot transcribes the audio, extracts a
+records by sending **Telegram voice notes**. The bot transcribes the audio, extracts a
 structured ledger entry with an LLM, stores it, and replies with a confirmation.
 
 The guiding principle: **the hard technical work is handled by the AI; the user just says
@@ -17,9 +17,7 @@ clear confirmations, and minimal setup.
 ## Stack
 
 - Node.js 20 + TypeScript
-- WhatsApp Cloud API (official Meta Graph API) — use the official API, not unofficial
-  web-scraping libraries (they risk getting the user's real number banned).
-- Hono for the webhook server
+- Telegram Bot API (free) via long polling — no webhook/public URL needed.
 - Whisper for speech-to-text (provider configurable)
 - LLM extraction, provider-agnostic via env vars
 - SQLite (better-sqlite3) for storage

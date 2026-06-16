@@ -14,7 +14,7 @@ export async function transcribe(audio: Buffer, mimeType = "audio/ogg"): Promise
 
   const form = new FormData();
   const ext = mimeType.split("/")[1] ?? "ogg";
-  form.append("file", new Blob([audio], { type: mimeType }), `voice.${ext}`);
+  form.append("file", new Blob([new Uint8Array(audio)], { type: mimeType }), `voice.${ext}`);
   form.append("model", config.transcribe.model);
   form.append("language", config.defaultLanguage);
 
