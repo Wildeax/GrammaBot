@@ -100,14 +100,23 @@ function numOrNull(v: unknown): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// Map whatever word the model used to our two canonical directions.
+function normalizeDirection(v: unknown): "income" | "expense" | null {
+  const s = String(v ?? "").toLowerCase();
+  if (/(income|ingreso|entrada|entró|entro|venta|cobr|credit|^in$)/.test(s)) return "income";
+  if (/(expense|gasto|egreso|salida|salió|salio|pago|pagu|out|debit)/.test(s)) return "expense";
+  return null;
+}
+
 function toEntry(raw: RawEntry, today: string): ExtractedEntry | null {
-  if (raw.direction !== "income" && raw.direction !== "expense") return null;
+  const direction = normalizeDirection(raw.direction);
+  if (!direction) return null;
   const amount = numOrNull(raw.amount);
   const concept = raw.concept ?? null;
   // Keep entries that have a concept even without amount (recorded as pending).
   if (amount === null && !concept) return null;
   return {
-    direction: raw.direction,
+    direction,
     amount: amount ?? 0,
     currency: (raw.currency || config.defaultCurrency).toUpperCase(),
     concept,
