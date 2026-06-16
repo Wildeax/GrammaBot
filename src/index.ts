@@ -1,5 +1,5 @@
-// Telegram bot: long-polls for messages, interprets them, and acts
-// (record entries / summary / search / delete last / export CSV).
+// Telegram bot: long-polls for messages, guards + interprets them, and acts
+// (record entries / complete pending / summary / search / delete / export CSV).
 
 import { config } from "./config.js";
 import {
@@ -10,16 +10,32 @@ import {
   type TelegramMessage,
 } from "./telegram.js";
 import { transcribe } from "./transcribe.js";
-import { interpret } from "./extract.js";
+import { interpret, InterpretError } from "./extract.js";
+import { guardInput, type GuardCategory } from "./guard.js";
+import { localToday, localMonthStart } from "./time.js";
 import {
-  insertEntry,
-  deleteLast,
+  recordEntries,
+  completePending,
+  deleteLastBatch,
   entriesBetween,
   searchEntries,
   pendingEntries,
   allEntries,
+  isProcessed,
+  markProcessed,
+  getOffset,
+  setOffset,
+  recordFailed,
+  type EntryFields,
   type LedgerEntry,
 } from "./db.js";
+
+interface Ctx {
+  chatId: number;
+  messageId: number;
+  authorUserId: string | null;
+  authorName: string | null;
+}
 
 const WELCOME =
   "¡Hola! Soy tu asistente de cuentas 🧾\n\n" +
@@ -30,10 +46,18 @@ const WELCOME =
   "También podés decirme:\n" +
   '• "¿Cuánto gasté en enero?" — resumen de cualquier mes\n' +
   '• "¿Cuánto le pagué a Danilo?" — buscar movimientos\n' +
+  '• "Lo de Wilfer fueron 100 mil" — completar un pendiente\n' +
   '• "Borrá lo último" — si te equivocaste\n' +
-  "• /pendientes — trabajos sin monto\n" +
-  "• /exportar — bajar todo en un archivo de Excel\n\n" +
-  "Mandame una nota de voz cuando quieras 🙂";
+  "• /pendientes — trabajos sin monto · /exportar — bajar todo en Excel\n\n" +
+  "Esto es privado: solo vos ves tus cuentas. Mandame una nota de voz cuando quieras 🙂";
+
+const GUARD_REPLIES: Record<GuardCategory, string> = {
+  bookkeeping: "",
+  offtopic:
+    "Solo te puedo ayudar con tus cuentas 🧾. Contame un gasto o ingreso, o pedime un resumen.",
+  jailbreak: "Soy solo tu asistente de cuentas 🙂. Contame qué querés anotar.",
+  abusive: "Mejor sigamos con las cuentas 🙂.",
+};
 
 // --- formatting helpers ---------------------------------------------------
 
@@ -51,15 +75,9 @@ function fmtDate(iso: string): string {
   if (!y || mi < 0 || mi > 11) return iso;
   return `${Number(d)} ${MONTHS[mi]} ${y}`;
 }
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
-function monthStart(): string {
-  return `${new Date().toISOString().slice(0, 7)}-01`;
-}
 
 /** Two-line compact-but-detailed rendering of one entry. */
-function renderEntry(e: LedgerEntry): string {
+function renderEntry(e: EntryFields): string {
   const icon = e.direction === "income" ? "🟢" : "🔴";
   const money = e.status === "pending" ? "⏳ Pendiente" : `${icon} ${fmtMoney(e.amount, e.currency)}`;
   const detail: string[] = [];
@@ -75,28 +93,50 @@ function renderEntry(e: LedgerEntry): string {
 // --- access control -------------------------------------------------------
 
 function isAllowed(chatId: number): boolean {
-  return (
-    config.allowedChatIds.length === 0 ||
-    config.allowedChatIds.includes(String(chatId))
-  );
+  if (config.allowedChatIds.length > 0) return config.allowedChatIds.includes(String(chatId));
+  return config.allowAnyone; // fail-closed: empty allow-list denies unless ALLOW_ANYONE is set
 }
 
 // --- message dispatch -----------------------------------------------------
 
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const chatId = msg.chat.id;
+  const messageId = msg.message_id;
   const text = msg.text?.trim() ?? "";
-  console.log(`message from chat ${chatId}: ${msg.voice ? "[voice]" : text}`);
+
+  // Idempotency: never process the same Telegram message twice (redelivery / crash-replay).
+  if (isProcessed(String(chatId), messageId)) return;
+
+  if (config.debug) {
+    console.log(`msg chat=${chatId} ${msg.voice ? "[voice]" : JSON.stringify(text)}`);
+  } else {
+    console.log(`msg chat=${chatId} ${msg.voice ? "voice" : "text"}`);
+  }
 
   try {
+    // /miid is intentionally pre-auth so a new family member can fetch their ID.
     if (text.toLowerCase().startsWith("/miid")) {
       await sendText(chatId, `Tu ID de chat es: ${chatId}`);
       return;
     }
+
+    // Privacy: this bot is per-person; refuse group chats (where isolation would collapse).
+    if (msg.chat.type && msg.chat.type !== "private") {
+      await sendText(chatId, "Por privacidad, hablame en un chat privado, no en grupos 🙂");
+      return;
+    }
+
     if (!isAllowed(chatId)) {
       await sendText(chatId, "Este asistente es privado 🔒");
       return;
     }
+
+    const ctx: Ctx = {
+      chatId,
+      messageId,
+      authorUserId: msg.from ? String(msg.from.id) : null,
+      authorName: msg.from?.first_name ?? msg.from?.username ?? null,
+    };
 
     const lower = text.toLowerCase();
     if (lower.startsWith("/start") || lower.startsWith("/help") || lower.startsWith("/ayuda")) {
@@ -106,25 +146,34 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
     } else if (lower.startsWith("/pendientes")) {
       await handlePending(chatId);
     } else if (lower.startsWith("/resumen")) {
-      await handleSummary(chatId, monthStart(), today(), "este mes");
+      await handleSummary(chatId, localMonthStart(), localToday(), "este mes");
     } else if (msg.voice ?? msg.audio) {
-      await handleTranscribed(chatId, (msg.voice ?? msg.audio)!.file_id);
+      await handleTranscribed(ctx, (msg.voice ?? msg.audio)!.file_id);
     } else if (text) {
-      await handleTranscribed(chatId, null, text);
+      await handleTranscribed(ctx, null, text);
     } else {
       await sendText(chatId, "Mandame una nota de voz contándome qué anotar 🙂");
     }
   } catch (err) {
     console.error("message error:", err);
-    await sendText(chatId, "Uy, algo salió mal procesando eso. Probá de nuevo.");
+    await sendText(chatId, "Uy, algo salió mal procesando eso. Probá de nuevo.").catch(() => {});
+  } finally {
+    // Mark handled so a redelivery/replay won't repeat it. (Entry inserts also mark
+    // atomically inside recordEntries; this covers commands/queries/guard rejects too.)
+    try {
+      markProcessed(String(chatId), messageId);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
 async function handleTranscribed(
-  chatId: number,
+  ctx: Ctx,
   fileId: string | null,
   typedText?: string
 ): Promise<void> {
+  const { chatId, messageId } = ctx;
   let transcript: string;
   if (fileId) {
     const { buffer, mimeType } = await downloadFile(fileId);
@@ -132,26 +181,70 @@ async function handleTranscribed(
   } else {
     transcript = typedText ?? "";
   }
-  if (!transcript) return;
-  console.log(`transcript (chat ${chatId}): ${transcript}`);
+  if (!transcript.trim()) return;
+  if (config.debug) console.log(`transcript chat=${chatId}: ${transcript}`);
 
-  const action = await interpret(transcript, today());
+  // First-stage guard: reject jailbreak / off-topic / abuse cheaply before the main model.
+  const verdict = await guardInput(transcript);
+  if (!verdict.allow) {
+    await sendText(chatId, GUARD_REPLIES[verdict.category]);
+    return;
+  }
+
+  let action;
+  try {
+    action = await interpret(transcript, localToday());
+  } catch (err) {
+    if (err instanceof InterpretError) {
+      recordFailed(String(chatId), messageId, transcript, err.message);
+      await sendText(
+        chatId,
+        "No pude procesar esto ahora mismo 😕. Lo guardé para no perderlo:\n\n" +
+          `"${transcript}"\n\nReenviámelo en un momentito, por favor.`
+      );
+      return;
+    }
+    throw err;
+  }
 
   switch (action.intent) {
     case "entries": {
-      const blocks = action.entries.map((e) => {
-        insertEntry({ chatId: String(chatId), rawTranscript: transcript, ...e });
-        return renderEntry(e as LedgerEntry);
-      });
+      recordEntries(
+        {
+          chatId: String(chatId),
+          messageId,
+          authorUserId: ctx.authorUserId,
+          authorName: ctx.authorName,
+          rawTranscript: transcript,
+        },
+        action.entries
+      );
+      const blocks = action.entries.map((e) => renderEntry(e)).join("\n\n");
       const pendingCount = action.entries.filter((e) => e.status === "pending").length;
       const header =
-        action.entries.length > 1
-          ? `✅ Anoté ${action.entries.length} movimientos:`
-          : "✅ Anotado:";
-      let footer = "";
-      if (pendingCount > 0)
-        footer = `\n\n⏳ ${pendingCount} sin monto. Cuando sepas cuánto fue, contame y lo completás.`;
-      await sendText(chatId, `${header}\n\n${blocks.join("\n\n")}${footer}`);
+        action.entries.length > 1 ? `✅ Anoté ${action.entries.length} movimientos:` : "✅ Anotado:";
+      const footer =
+        pendingCount > 0
+          ? `\n\n⏳ ${pendingCount} sin monto. Cuando sepas cuánto fue, decime "lo de … fueron …".`
+          : "";
+      await sendText(chatId, `${header}\n\n${blocks}${footer}`);
+      break;
+    }
+    case "complete_pending": {
+      const r = completePending(String(chatId), action.amount, {
+        counterparty: action.counterparty,
+        which: action.which,
+      });
+      if (!r.completed) {
+        await sendText(
+          chatId,
+          r.hadPending
+            ? 'No supe cuál pendiente completar. Mirá /pendientes y decime "completá el N con MONTO".'
+            : "No tenés trabajos pendientes para completar 👍"
+        );
+      } else {
+        await sendText(chatId, `✅ Completé el pendiente:\n\n${renderEntry(r.completed)}`);
+      }
       break;
     }
     case "summary":
@@ -248,24 +341,26 @@ async function handlePending(chatId: number): Promise<void> {
     await sendText(chatId, "No tenés trabajos pendientes de monto 👍");
     return;
   }
-  const blocks = items.map((e) => renderEntry(e)).join("\n\n");
+  const blocks = items.map((e, i) => `${i + 1}. ${renderEntry(e)}`).join("\n\n");
   await sendText(
     chatId,
     `⏳ ${items.length} sin monto:\n\n${blocks}\n\n` +
-      "Cuando sepas cuánto fue cada uno, contámelo (ej: \"a Wilfer le pagué 100 mil\")."
+      'Para completar uno, decime el monto (ej: "lo de Wilfer fueron 100 mil" o "completá el 2 con 100 mil").'
   );
 }
 
 async function handleDeleteLast(chatId: number): Promise<void> {
-  const removed = deleteLast(String(chatId));
-  if (!removed) {
+  const removed = deleteLastBatch(String(chatId));
+  if (removed.length === 0) {
     await sendText(chatId, "No hay nada para borrar.");
     return;
   }
-  await sendText(chatId, `🗑️ Borré la última anotación:\n\n${renderEntry(removed)}`);
+  const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
+  const header = removed.length > 1 ? `🗑️ Borré las últimas ${removed.length} anotaciones:` : "🗑️ Borré la última anotación:";
+  await sendText(chatId, `${header}\n\n${blocks}`);
 }
 
-function csvField(value: string | number | null): string {
+function csvField(value: string | number | null | undefined): string {
   const s = value === null || value === undefined ? "" : String(value);
   return `"${s.replace(/"/g, '""')}"`;
 }
@@ -277,8 +372,8 @@ async function handleExport(chatId: number): Promise<void> {
     return;
   }
   const header =
-    "fecha,tipo,concepto,monto,moneda,cantidad,unidad,precio_unitario,quien,categoria,estado,nota";
-  const rows = entries.map((e) =>
+    "fecha,tipo,concepto,monto,moneda,cantidad,unidad,precio_unitario,quien,categoria,anotado_por,estado,nota";
+  const rows = entries.map((e: LedgerEntry) =>
     [
       csvField(e.occurredOn),
       csvField(e.direction === "income" ? "ingreso" : "gasto"),
@@ -290,12 +385,13 @@ async function handleExport(chatId: number): Promise<void> {
       csvField(e.unitPrice),
       csvField(e.counterparty),
       csvField(e.category),
+      csvField(e.authorName),
       csvField(e.status === "pending" ? "pendiente" : "registrado"),
       csvField(e.note),
     ].join(",")
   );
   const csv = "﻿" + [header, ...rows].join("\n"); // BOM so Excel reads UTF-8
-  await sendDocument(chatId, `cuentas-${today()}.csv`, csv);
+  await sendDocument(chatId, `cuentas-${localToday()}.csv`, csv);
   await sendText(chatId, `📄 Listo, exporté ${entries.length} anotaciones.`);
 }
 
@@ -303,18 +399,23 @@ async function main(): Promise<void> {
   if (!config.telegram.botToken) {
     throw new Error("TELEGRAM_BOT_TOKEN is not set");
   }
-  console.log("GrammaBot is running (Telegram long polling).");
+  console.log(`GrammaBot running. timezone=${config.timezone} guard=${config.guard.enabled ? config.guard.model : "off"}`);
   if (config.allowedChatIds.length > 0) {
     console.log(`Access restricted to chat IDs: ${config.allowedChatIds.join(", ")}`);
+  } else if (config.allowAnyone) {
+    console.warn("WARNING: ALLOW_ANYONE is set — the bot is open to everyone.");
+  } else {
+    console.warn("WARNING: ALLOWED_CHAT_IDS is empty and ALLOW_ANYONE is not set — denying everyone (fail-closed).");
   }
 
-  let offset = 0;
+  let offset = getOffset();
   for (;;) {
     try {
       const updates = await getUpdates(offset);
       for (const update of updates) {
-        offset = update.update_id + 1;
         if (update.message) await handleMessage(update.message);
+        offset = update.update_id + 1;
+        setOffset(offset); // advance only after the message is fully handled
       }
     } catch (err) {
       console.error("polling error:", err);

@@ -38,12 +38,13 @@ export async function transcribe(audio: Buffer, mimeType = "audio/ogg"): Promise
         format: formatFromMime(mimeType),
       },
     }),
+    signal: AbortSignal.timeout(60000),
   });
 
   if (!res.ok) {
-    throw new Error(`Transcription failed: ${res.status} ${await res.text()}`);
+    throw new Error(`Transcription failed: ${res.status} ${await res.text().catch(() => "")}`);
   }
 
-  const data = (await res.json()) as { text: string };
-  return data.text.trim();
+  const data = (await res.json().catch(() => null)) as { text?: string } | null;
+  return typeof data?.text === "string" ? data.text.trim() : "";
 }

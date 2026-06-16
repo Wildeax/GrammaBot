@@ -7,7 +7,7 @@ export interface LedgerEntry {
   id?: number;
   chatId: string;
   direction: "income" | "expense";
-  amount: number; // 0 when status is "pending"
+  amount: number; // whole pesos; 0 when status is "pending"
   currency: string;
   concept: string | null; // rich, concise description of what it was for
   category: string | null; // short bucket, e.g. "mano de obra", "insumos"
@@ -16,11 +16,22 @@ export interface LedgerEntry {
   unit: string | null; // e.g. "jornal", "kg", "bulto"
   unitPrice: number | null; // price per unit
   note: string | null;
-  occurredOn: string; // ISO date (YYYY-MM-DD)
+  occurredOn: string; // ISO date (YYYY-MM-DD), the user's LOCAL day
   status: "recorded" | "pending";
   rawTranscript: string;
+  // Set by the dispatcher, not the model:
+  authorUserId: string | null;
+  authorName: string | null;
+  messageId: number | null;
   createdAt?: string;
+  deletedAt?: string | null;
 }
+
+/** Fields produced by interpretation (everything the model decides about one movement). */
+export type EntryFields = Omit<
+  LedgerEntry,
+  "id" | "chatId" | "rawTranscript" | "authorUserId" | "authorName" | "messageId" | "createdAt" | "deletedAt"
+>;
 
 const db = new Database(config.databasePath);
 db.pragma("journal_mode = WAL");
@@ -54,48 +65,138 @@ addColumn("quantity", "REAL");
 addColumn("unit", "TEXT");
 addColumn("unit_price", "REAL");
 addColumn("status", "TEXT NOT NULL DEFAULT 'recorded'");
+addColumn("author_user_id", "TEXT");
+addColumn("author_name", "TEXT");
+addColumn("message_id", "INTEGER");
+addColumn("deleted_at", "TEXT");
+
+// Index the hot path (per-user, by date). Cheap and idempotent.
+db.exec(`CREATE INDEX IF NOT EXISTS idx_ledger_chat ON ledger(chat_id, occurred_on)`);
+
+// Idempotency: remember which Telegram messages we've already fully processed.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS processed_messages (
+    chat_id    TEXT    NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (chat_id, message_id)
+  );
+`);
+
+// Durable key/value (e.g. the Telegram long-poll offset).
+db.exec(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+
+// Nothing is ever silently lost: messages we couldn't interpret are kept here.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS failed_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    TEXT    NOT NULL,
+    message_id INTEGER,
+    transcript TEXT    NOT NULL,
+    error      TEXT,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+`);
 
 const SELECT_COLUMNS = `id, chat_id AS chatId, direction, amount, currency,
   concept, category, counterparty, quantity, unit, unit_price AS unitPrice,
-  note, occurred_on AS occurredOn, status,
-  raw_transcript AS rawTranscript, created_at AS createdAt`;
+  note, occurred_on AS occurredOn, status, author_user_id AS authorUserId,
+  author_name AS authorName, message_id AS messageId,
+  raw_transcript AS rawTranscript, created_at AS createdAt, deleted_at AS deletedAt`;
+
+const insertStmt = db.prepare(`
+  INSERT INTO ledger
+    (chat_id, direction, amount, currency, concept, category, counterparty,
+     quantity, unit, unit_price, note, occurred_on, status,
+     author_user_id, author_name, message_id, raw_transcript)
+  VALUES
+    (@chatId, @direction, @amount, @currency, @concept, @category, @counterparty,
+     @quantity, @unit, @unitPrice, @note, @occurredOn, @status,
+     @authorUserId, @authorName, @messageId, @rawTranscript)
+`);
 
 export function insertEntry(entry: LedgerEntry): number {
-  const stmt = db.prepare(`
-    INSERT INTO ledger
-      (chat_id, direction, amount, currency, concept, category, counterparty,
-       quantity, unit, unit_price, note, occurred_on, status, raw_transcript)
-    VALUES
-      (@chatId, @direction, @amount, @currency, @concept, @category, @counterparty,
-       @quantity, @unit, @unitPrice, @note, @occurredOn, @status, @rawTranscript)
-  `);
-  return Number(stmt.run(entry).lastInsertRowid);
+  return Number(insertStmt.run(entry).lastInsertRowid);
 }
 
-export function listEntries(chatId: string, limit = 20): LedgerEntry[] {
-  return db
-    .prepare(
-      `SELECT ${SELECT_COLUMNS} FROM ledger WHERE chat_id = ? ORDER BY id DESC LIMIT ?`
-    )
-    .all(chatId, limit) as LedgerEntry[];
+export interface EntryMeta {
+  chatId: string;
+  messageId: number | null;
+  authorUserId: string | null;
+  authorName: string | null;
+  rawTranscript: string;
 }
 
-/** All entries on or after the given ISO date (YYYY-MM-DD), oldest first. */
-export function entriesSince(chatId: string, sinceIso: string): LedgerEntry[] {
-  return db
-    .prepare(
-      `SELECT ${SELECT_COLUMNS} FROM ledger
-       WHERE chat_id = ? AND occurred_on >= ? ORDER BY occurred_on ASC, id ASC`
-    )
-    .all(chatId, sinceIso) as LedgerEntry[];
+/**
+ * Atomically insert a batch of entries AND mark the source message processed,
+ * so a mid-batch crash is all-or-nothing and the message can never double-record.
+ */
+export const recordEntries = db.transaction(
+  (meta: EntryMeta, entries: EntryFields[]): void => {
+    for (const e of entries) {
+      insertStmt.run({
+        ...e,
+        amount: Math.round(e.amount),
+        unitPrice: e.unitPrice === null ? null : Math.round(e.unitPrice),
+        chatId: meta.chatId,
+        messageId: meta.messageId,
+        authorUserId: meta.authorUserId,
+        authorName: meta.authorName,
+        rawTranscript: meta.rawTranscript,
+      });
+    }
+    if (meta.messageId !== null) markProcessed(meta.chatId, meta.messageId);
+  }
+);
+
+// --- idempotency ----------------------------------------------------------
+
+export function isProcessed(chatId: string, messageId: number): boolean {
+  return !!db
+    .prepare(`SELECT 1 FROM processed_messages WHERE chat_id = ? AND message_id = ?`)
+    .get(chatId, messageId);
 }
 
-/** Entries within an inclusive date range (YYYY-MM-DD), oldest first. */
+export function markProcessed(chatId: string, messageId: number): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO processed_messages (chat_id, message_id) VALUES (?, ?)`
+  ).run(chatId, messageId);
+}
+
+// --- durable offset -------------------------------------------------------
+
+export function getOffset(): number {
+  const row = db.prepare(`SELECT value FROM meta WHERE key = 'offset'`).get() as
+    | { value: string }
+    | undefined;
+  return row ? Number(row.value) : 0;
+}
+
+export function setOffset(offset: number): void {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES ('offset', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(String(offset));
+}
+
+export function recordFailed(
+  chatId: string,
+  messageId: number | null,
+  transcript: string,
+  error: string
+): void {
+  db.prepare(
+    `INSERT INTO failed_messages (chat_id, message_id, transcript, error) VALUES (?, ?, ?, ?)`
+  ).run(chatId, messageId, transcript, error);
+}
+
+// --- queries (all scoped by chat_id and excluding soft-deleted rows) -------
+
 export function entriesBetween(chatId: string, from: string, to: string): LedgerEntry[] {
   return db
     .prepare(
       `SELECT ${SELECT_COLUMNS} FROM ledger
-       WHERE chat_id = ? AND occurred_on >= ? AND occurred_on <= ?
+       WHERE chat_id = ? AND deleted_at IS NULL AND occurred_on >= ? AND occurred_on <= ?
        ORDER BY occurred_on ASC, id ASC`
     )
     .all(chatId, from, to) as LedgerEntry[];
@@ -108,13 +209,12 @@ export interface SearchFilters {
   to: string | null;
 }
 
-/** Search past entries by keyword (concept/note/counterparty), person and/or date range. */
 export function searchEntries(
   chatId: string,
   filters: SearchFilters,
   limit = 25
 ): LedgerEntry[] {
-  const where: string[] = ["chat_id = ?"];
+  const where: string[] = ["chat_id = ?", "deleted_at IS NULL"];
   const params: unknown[] = [chatId];
 
   if (filters.text) {
@@ -147,31 +247,99 @@ export function searchEntries(
 export function allEntries(chatId: string): LedgerEntry[] {
   return db
     .prepare(
-      `SELECT ${SELECT_COLUMNS} FROM ledger WHERE chat_id = ? ORDER BY occurred_on ASC, id ASC`
+      `SELECT ${SELECT_COLUMNS} FROM ledger
+       WHERE chat_id = ? AND deleted_at IS NULL ORDER BY occurred_on ASC, id ASC`
     )
     .all(chatId) as LedgerEntry[];
 }
 
-/** Entries still waiting for an amount. */
+/** Pending entries (no amount yet), oldest first — same order shown to the user. */
 export function pendingEntries(chatId: string): LedgerEntry[] {
   return db
     .prepare(
       `SELECT ${SELECT_COLUMNS} FROM ledger
-       WHERE chat_id = ? AND status = 'pending' ORDER BY occurred_on ASC, id ASC`
+       WHERE chat_id = ? AND deleted_at IS NULL AND status = 'pending'
+       ORDER BY occurred_on ASC, id ASC`
     )
     .all(chatId) as LedgerEntry[];
 }
 
-/** Delete the most recent entry for a chat; returns it, or null if none. */
-export function deleteLast(chatId: string): LedgerEntry | null {
-  const row = db
+/**
+ * Soft-delete the most recent batch (all entries from the latest message) for a chat.
+ * Returns the removed rows, or [] if there was nothing to delete.
+ */
+export function deleteLastBatch(chatId: string): LedgerEntry[] {
+  const last = db
     .prepare(
-      `SELECT ${SELECT_COLUMNS} FROM ledger WHERE chat_id = ? ORDER BY id DESC LIMIT 1`
+      `SELECT ${SELECT_COLUMNS} FROM ledger
+       WHERE chat_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`
     )
     .get(chatId) as LedgerEntry | undefined;
-  if (!row) return null;
-  db.prepare(`DELETE FROM ledger WHERE id = ?`).run(row.id);
-  return row;
+  if (!last) return [];
+
+  const targets =
+    last.messageId !== null
+      ? (db
+          .prepare(
+            `SELECT ${SELECT_COLUMNS} FROM ledger
+             WHERE chat_id = ? AND deleted_at IS NULL AND message_id = ?
+             ORDER BY id ASC`
+          )
+          .all(chatId, last.messageId) as LedgerEntry[])
+      : [last];
+
+  const ids = targets.map((t) => t.id);
+  const mark = db.prepare(`UPDATE ledger SET deleted_at = datetime('now') WHERE id = ?`);
+  const tx = db.transaction((rowIds: (number | undefined)[]) => {
+    for (const id of rowIds) mark.run(id);
+  });
+  tx(ids);
+  return targets;
+}
+
+export interface CompleteResult {
+  completed: LedgerEntry | null;
+  hadPending: boolean;
+}
+
+/**
+ * Fill in the amount of a pending entry.
+ * Target selection: explicit 1-based index (as shown by /pendientes) → by counterparty →
+ * else the most recent pending entry.
+ */
+export function completePending(
+  chatId: string,
+  amount: number,
+  opts: { counterparty?: string | null; which?: number | null; unitPrice?: number | null } = {}
+): CompleteResult {
+  const pend = pendingEntries(chatId);
+  if (pend.length === 0) return { completed: null, hadPending: false };
+
+  let target: LedgerEntry | undefined;
+  if (opts.which && opts.which >= 1 && opts.which <= pend.length) {
+    target = pend[opts.which - 1];
+  } else if (opts.counterparty) {
+    const cp = opts.counterparty.toLowerCase();
+    const matches = pend.filter((p) => (p.counterparty || "").toLowerCase().includes(cp));
+    target = matches[matches.length - 1]; // most recent match
+  }
+  if (!target) target = pend[pend.length - 1]; // most recent pending
+
+  db.prepare(
+    `UPDATE ledger
+       SET amount = ?, unit_price = COALESCE(?, unit_price), status = 'recorded'
+     WHERE id = ? AND chat_id = ? AND status = 'pending' AND deleted_at IS NULL`
+  ).run(
+    Math.round(amount),
+    opts.unitPrice === null || opts.unitPrice === undefined ? null : Math.round(opts.unitPrice),
+    target.id,
+    chatId
+  );
+
+  const updated = db
+    .prepare(`SELECT ${SELECT_COLUMNS} FROM ledger WHERE id = ?`)
+    .get(target.id) as LedgerEntry;
+  return { completed: updated, hadPending: true };
 }
 
 export default db;
