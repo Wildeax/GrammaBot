@@ -34,6 +34,16 @@ export const config = {
     model: optional("GUARD_MODEL", "google/gemini-2.5-flash-lite"),
   },
 
+  // Owner chat that receives ops alerts (e.g. low OpenRouter credit). Defaults to the
+  // first allowed chat id if not set explicitly.
+  ownerChatId: optional("OWNER_CHAT_ID", ""),
+  // Alert the owner when OpenRouter remaining credit drops below this (USD).
+  creditAlertUsd: Number(optional("CREDIT_ALERT_USD", "1")),
+  // Hour (in the configured timezone) at which scheduled reports go out.
+  reportHour: Number(optional("REPORT_HOUR", "8")),
+  // Send a weekly summary too (on Mondays). Monthly close always goes out on the 1st.
+  weeklySummary: !flag("WEEKLY_SUMMARY_OFF"),
+
   defaultLanguage: optional("DEFAULT_LANGUAGE", "es"),
   defaultCurrency: optional("DEFAULT_CURRENCY", "COP"),
   // Civil timezone used to compute "today" / month boundaries (the users are in Colombia).
@@ -49,3 +59,9 @@ export const config = {
   // Explicit opt-in to allow ANYONE. Without this, an empty allow-list denies all (fail-closed).
   allowAnyone: flag("ALLOW_ANYONE"),
 };
+
+/** The chat that should receive ops alerts (explicit OWNER_CHAT_ID, else first allowed id). */
+export function ownerChat(): number | null {
+  const id = config.ownerChatId || config.allowedChatIds[0];
+  return id ? Number(id) : null;
+}

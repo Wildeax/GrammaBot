@@ -11,7 +11,8 @@
     "test": "npm run build && node test/smoke.mjs"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0"
+    "better-sqlite3": "^11.7.0",
+    "exceljs": "^4.4.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

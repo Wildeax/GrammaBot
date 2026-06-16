@@ -115,6 +115,35 @@ if (a5.intent === "entries") {
   check("parsed 1.500.000 (entries)", false, JSON.stringify(a5));
 }
 
+console.log(`\n# new features: categories / edit / summary / excel`);
+const cats = await import("../dist/categories.js");
+check("normalize jornales -> mano de obra", cats.normalizeCategory("jornales") === "mano de obra");
+check("normalize abono -> insumos", cats.normalizeCategory("abono") === "insumos");
+check("normalize gas -> servicios", cats.normalizeCategory("gas") === "servicios");
+check("normalize unknown kept", cats.normalizeCategory("Cualquier Cosa") === "cualquier cosa");
+
+const aEdit = await interpret("cambiá el monto del último a 200 mil", today);
+check("edit_last intent + amount 200000", aEdit.intent === "edit_last" && aEdit.changes.amount === 200000, JSON.stringify(aEdit));
+
+const CHAT4 = "555";
+db.recordEntries({ chatId: CHAT4, messageId: 20, authorUserId: "1", authorName: "A", rawTranscript: "y" }, [
+  { direction: "expense", amount: 50000, currency: "COP", concept: "gas", category: "servicios", quantity: null, unit: null, unitPrice: null, counterparty: null, note: null, occurredOn: today, status: "recorded" },
+]);
+const edited = db.editLast(CHAT4, { amount: 200000 });
+check("editLast updates amount", edited && edited.amount === 200000, JSON.stringify(edited));
+
+const reports = await import("../dist/reports.js");
+const sumText = reports.buildSummaryText(CHAT4, "0000-01-01", today, "Test");
+check("buildSummaryText returns text", typeof sumText === "string" && sumText.includes("Gastos"), String(sumText).slice(0, 60));
+const wb = await reports.buildWorkbook(CHAT4);
+check("buildWorkbook returns bytes", wb && wb.length > 1000, `len=${wb && wb.length}`);
+
+const time = await import("../dist/time.js");
+const pm = time.previousMonthRange();
+check("previousMonthRange shape", /^\d{4}-\d{2}-01$/.test(pm.from) && /^\d{4}-\d{2}-\d{2}$/.test(pm.to), JSON.stringify(pm));
+check("localHour 0-23", time.localHour() >= 0 && time.localHour() <= 23);
+check("localWeekday 0-6", time.localWeekday() >= 0 && time.localWeekday() <= 6);
+
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 for (const ext of ["", "-wal", "-shm"]) { try { rmSync(TMP + ext); } catch {} }
 process.exit(fail ? 1 : 0);

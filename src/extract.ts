@@ -2,11 +2,13 @@
 // record entries, complete a pending one, show a summary, search, delete, or nothing.
 
 import { config } from "./config.js";
-import type { EntryFields } from "./db.js";
+import type { EntryFields, EntryEdit } from "./db.js";
+import { normalizeCategory, CANONICAL_CATEGORIES } from "./categories.js";
 
 export type Action =
   | { intent: "entries"; entries: EntryFields[] }
   | { intent: "complete_pending"; amount: number; counterparty: string | null; which: number | null }
+  | { intent: "edit_last"; changes: EntryEdit }
   | { intent: "summary"; from: string; to: string; label: string }
   | {
       intent: "search";
@@ -42,7 +44,7 @@ La moneda SIEMPRE es COP salvo que diga explícitamente otra.
    - "amount": total en pesos (número entero, SIN separadores). null si NO menciona monto.
    - "currency": "COP" salvo otra explícita.
    - "concept": descripción rica pero CONCISA (incluí cultivo/labor: "Preparación del terreno (picar)").
-   - "category": bucket corto ("mano de obra", "insumos", "siembra", "venta", etc.) o null.
+   - "category": elegí UNA de esta lista (o null): ${CANONICAL_CATEGORIES.join(", ")}.
    - "quantity": cantidad si aplica (ej. 3) o null. "unit": unidad ("jornal","kg","bulto") o null.
    - "unitPrice": precio por unidad si lo dice o se deduce o null.
    - "counterparty": persona/negocio o null. "note": detalle extra o null.
@@ -63,7 +65,12 @@ La moneda SIEMPRE es COP salvo que diga explícitamente otra.
 
 5) "delete_last" — borrar/deshacer la última anotación ("borrá lo último", "me equivoqué").
 
-6) "none" — saludo, ayuda, o nada de lo anterior.
+6) "edit_last" — corregir la ÚLTIMA anotación ("cambiá el monto del último a 200 mil", "el gas
+   fue 6 mil no 5", "cambiá la fecha a ayer", "ponele que fue de Danilo", "esa categoría es insumos").
+   Incluí SOLO los campos a cambiar (al nivel raíz): "amount", "occurredOn" (YYYY-MM-DD),
+   "concept", "counterparty", "category", "direction".
+
+7) "none" — saludo, ayuda, o nada de lo anterior.
 
 No incluyas texto fuera del JSON.`;
 
@@ -134,7 +141,7 @@ function toEntry(raw: RawEntry, today: string): EntryFields | null {
     amount: amount ?? 0,
     currency: (raw.currency || config.defaultCurrency).toUpperCase().slice(0, 8),
     concept,
-    category: raw.category ?? null,
+    category: normalizeCategory(raw.category),
     counterparty: raw.counterparty ?? null,
     quantity: numOrNull(raw.quantity),
     unit: raw.unit ?? null,
@@ -224,6 +231,22 @@ export async function interpret(transcript: string, today: string): Promise<Acti
 
   if (parsed.intent === "delete_last") {
     return { intent: "delete_last" };
+  }
+
+  if (parsed.intent === "edit_last") {
+    const changes: EntryEdit = {};
+    const amt = parseMoney(parsed.amount);
+    if (amt !== null) changes.amount = amt;
+    if (typeof parsed.occurredOn === "string" && DATE_RE.test(parsed.occurredOn)) {
+      changes.occurredOn = parsed.occurredOn;
+    }
+    if (parsed.concept) changes.concept = parsed.concept;
+    if (parsed.counterparty) changes.counterparty = parsed.counterparty;
+    if (parsed.category) changes.category = normalizeCategory(parsed.category) ?? undefined;
+    const dir = normalizeDirection(parsed.direction);
+    if (dir) changes.direction = dir;
+    if (Object.keys(changes).length === 0) return { intent: "none" };
+    return { intent: "edit_last", changes };
   }
 
   const rawEntries: RawEntry[] = Array.isArray(parsed.entries)

@@ -15,9 +15,22 @@ export interface TelegramMessage {
   audio?: { file_id: string; mime_type?: string };
 }
 
+export interface CallbackQuery {
+  id: string;
+  data?: string;
+  from?: { id: number; first_name?: string; username?: string };
+  message?: { message_id: number; chat: { id: number; type?: string } };
+}
+
 interface Update {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: CallbackQuery;
+}
+
+export interface InlineButton {
+  text: string;
+  callback_data: string;
 }
 
 interface TgResponse<T> {
@@ -80,21 +93,57 @@ async function call<T>(
   throw lastErr instanceof Error ? lastErr : new Error(`Telegram ${method} failed`);
 }
 
-/** Send a plain text message to a chat (retried/timeout-guarded). */
-export async function sendText(chatId: number, text: string): Promise<void> {
-  await call("sendMessage", { chat_id: chatId, text });
+/** Send a plain text message, optionally with a single row of inline buttons. */
+export async function sendText(
+  chatId: number,
+  text: string,
+  buttons?: InlineButton[]
+): Promise<void> {
+  const body: Record<string, unknown> = { chat_id: chatId, text };
+  if (buttons && buttons.length) body.reply_markup = { inline_keyboard: [buttons] };
+  await call("sendMessage", body);
 }
 
-/** Send an in-memory file (e.g. a CSV) to a chat as a document. */
+/** Acknowledge a callback query (stops the button's loading spinner). */
+export async function answerCallbackQuery(id: string, text?: string): Promise<void> {
+  try {
+    await call("answerCallbackQuery", { callback_query_id: id, text }, { retries: 0 });
+  } catch {
+    /* non-critical */
+  }
+}
+
+/** Remove the inline keyboard from a previously-sent message. */
+export async function clearButtons(chatId: number, messageId: number): Promise<void> {
+  try {
+    await call(
+      "editMessageReplyMarkup",
+      { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } },
+      { retries: 0 }
+    );
+  } catch {
+    /* non-critical */
+  }
+}
+
+/** Register the bot's command menu (shown in the Telegram UI). */
+export async function setMyCommands(
+  commands: { command: string; description: string }[]
+): Promise<void> {
+  await call("setMyCommands", { commands });
+}
+
+/** Send an in-memory file (text or binary, e.g. an .xlsx) to a chat as a document. */
 export async function sendDocument(
   chatId: number,
   filename: string,
-  content: string,
+  content: string | Uint8Array,
   mimeType = "text/csv"
 ): Promise<void> {
   const form = new FormData();
   form.append("chat_id", String(chatId));
-  form.append("document", new Blob([content], { type: mimeType }), filename);
+  const part = typeof content === "string" ? content : new Uint8Array(content);
+  form.append("document", new Blob([part], { type: mimeType }), filename);
 
   const res = await fetch(`${apiUrl}/sendDocument`, {
     method: "POST",
@@ -109,7 +158,7 @@ export async function sendDocument(
 export async function getUpdates(offset: number, timeoutSeconds = 30): Promise<Update[]> {
   return call<Update[]>(
     "getUpdates",
-    { offset, timeout: timeoutSeconds, allowed_updates: ["message"] },
+    { offset, timeout: timeoutSeconds, allowed_updates: ["message", "callback_query"] },
     { timeoutMs: (timeoutSeconds + 15) * 1000, retries: 1 }
   );
 }

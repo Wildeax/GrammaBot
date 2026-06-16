@@ -165,18 +165,36 @@ export function markProcessed(chatId: string, messageId: number): void {
 
 // --- durable offset -------------------------------------------------------
 
-export function getOffset(): number {
-  const row = db.prepare(`SELECT value FROM meta WHERE key = 'offset'`).get() as
+export function metaGet(key: string): string | null {
+  const row = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(key) as
     | { value: string }
     | undefined;
-  return row ? Number(row.value) : 0;
+  return row ? row.value : null;
+}
+
+export function metaSet(key: string, value: string): void {
+  db.prepare(
+    `INSERT INTO meta (key, value) VALUES (?, ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+  ).run(key, value);
+}
+
+export function getOffset(): number {
+  const v = metaGet("offset");
+  return v ? Number(v) : 0;
 }
 
 export function setOffset(offset: number): void {
-  db.prepare(
-    `INSERT INTO meta (key, value) VALUES ('offset', ?)
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-  ).run(String(offset));
+  metaSet("offset", String(offset));
+}
+
+/** Distinct chats that have at least one (non-deleted) entry — used for scheduled reports. */
+export function distinctChatIds(): string[] {
+  return (
+    db.prepare(`SELECT DISTINCT chat_id FROM ledger WHERE deleted_at IS NULL`).all() as {
+      chat_id: string;
+    }[]
+  ).map((r) => String(r.chat_id));
 }
 
 export function recordFailed(
@@ -306,6 +324,77 @@ export function deleteLastBatch(chatId: string): LedgerEntry[] {
   });
   tx(ids);
   return targets;
+}
+
+/** Soft-delete a specific batch by its source Telegram message id (used by the Undo button). */
+export function deleteBatchByMessage(chatId: string, messageId: number): LedgerEntry[] {
+  const rows = db
+    .prepare(
+      `SELECT ${SELECT_COLUMNS} FROM ledger
+       WHERE chat_id = ? AND message_id = ? AND deleted_at IS NULL ORDER BY id ASC`
+    )
+    .all(chatId, messageId) as LedgerEntry[];
+  if (rows.length === 0) return [];
+  const mark = db.prepare(`UPDATE ledger SET deleted_at = datetime('now') WHERE id = ?`);
+  db.transaction((ids: (number | undefined)[]) => {
+    for (const id of ids) mark.run(id);
+  })(rows.map((r) => r.id));
+  return rows;
+}
+
+export interface EntryEdit {
+  amount?: number;
+  occurredOn?: string;
+  concept?: string;
+  counterparty?: string;
+  category?: string;
+  direction?: "income" | "expense";
+}
+
+/** Apply an edit to the most recent (non-deleted) entry of a chat. Returns the updated row or null. */
+export function editLast(chatId: string, edit: EntryEdit): LedgerEntry | null {
+  const last = db
+    .prepare(
+      `SELECT ${SELECT_COLUMNS} FROM ledger
+       WHERE chat_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`
+    )
+    .get(chatId) as LedgerEntry | undefined;
+  if (!last) return null;
+
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  if (edit.amount != null) {
+    sets.push("amount = ?", "status = 'recorded'");
+    params.push(Math.round(edit.amount));
+  }
+  if (edit.occurredOn) {
+    sets.push("occurred_on = ?");
+    params.push(edit.occurredOn);
+  }
+  if (edit.concept != null) {
+    sets.push("concept = ?");
+    params.push(edit.concept);
+  }
+  if (edit.counterparty != null) {
+    sets.push("counterparty = ?");
+    params.push(edit.counterparty);
+  }
+  if (edit.category != null) {
+    sets.push("category = ?");
+    params.push(edit.category);
+  }
+  if (edit.direction) {
+    sets.push("direction = ?");
+    params.push(edit.direction);
+  }
+  if (sets.length === 0) return last;
+
+  db.prepare(`UPDATE ledger SET ${sets.join(", ")} WHERE id = ? AND chat_id = ?`).run(
+    ...params,
+    last.id,
+    chatId
+  );
+  return db.prepare(`SELECT ${SELECT_COLUMNS} FROM ledger WHERE id = ?`).get(last.id) as LedgerEntry;
 }
 
 export interface CompleteResult {

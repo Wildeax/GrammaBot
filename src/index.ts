@@ -7,28 +7,33 @@ import {
   sendText,
   sendDocument,
   downloadFile,
+  answerCallbackQuery,
+  clearButtons,
+  setMyCommands,
   type TelegramMessage,
+  type CallbackQuery,
 } from "./telegram.js";
 import { transcribe } from "./transcribe.js";
 import { interpret, InterpretError } from "./extract.js";
 import { guardInput, type GuardCategory } from "./guard.js";
 import { localToday, localMonthStart } from "./time.js";
+import { fmtAmount, fmtMoney, fmtDate } from "./format.js";
+import { buildSummaryText, buildWorkbook, runScheduledReports, checkCredit } from "./reports.js";
 import {
   recordEntries,
   completePending,
+  editLast,
   deleteLastBatch,
-  entriesBetween,
+  deleteBatchByMessage,
   searchEntries,
   pendingEntries,
   recentDuplicate,
-  allEntries,
   isProcessed,
   markProcessed,
   getOffset,
   setOffset,
   recordFailed,
   type EntryFields,
-  type LedgerEntry,
 } from "./db.js";
 
 interface Ctx {
@@ -61,21 +66,6 @@ const GUARD_REPLIES: Record<GuardCategory, string> = {
 };
 
 // --- formatting helpers ---------------------------------------------------
-
-const MONTHS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
-
-function fmtAmount(n: number): string {
-  return `$${Math.round(n).toLocaleString("es-CO")}`;
-}
-function fmtMoney(amount: number, currency: string): string {
-  return `${fmtAmount(amount)} ${currency}`;
-}
-function fmtDate(iso: string): string {
-  const [y, m, d] = iso.split("-");
-  const mi = Number(m) - 1;
-  if (!y || mi < 0 || mi > 11) return iso;
-  return `${Number(d)} ${MONTHS[mi]} ${y}`;
-}
 
 const UNIT_ABBR = new Set(["kg", "g", "lt", "l", "mt", "m", "cm", "ha", "cc", "ml", "qq"]);
 function pluralizeUnit(unit: string, qty: number): string {
@@ -253,7 +243,19 @@ async function handleTranscribed(
         pendingCount > 0
           ? `\n\n⏳ ${pendingCount} sin monto. Cuando sepas cuánto fue, decime "lo de … fueron …".`
           : "";
-      await sendText(chatId, `${header}\n\n${blocks}${footer}`);
+      // Undo button tied to THIS message's batch (so it works even after later entries).
+      await sendText(chatId, `${header}\n\n${blocks}${footer}`, [
+        { text: "↩️ Deshacer", callback_data: `undo:${messageId}` },
+      ]);
+      break;
+    }
+    case "edit_last": {
+      const updated = editLast(String(chatId), action.changes);
+      if (!updated) {
+        await sendText(chatId, "No hay ninguna anotación reciente para corregir.");
+      } else {
+        await sendText(chatId, `✏️ Corregí la última anotación:\n\n${renderEntry(updated)}`);
+      }
       break;
     }
     case "complete_pending": {
@@ -299,56 +301,12 @@ async function handleSummary(
   to: string,
   label: string
 ): Promise<void> {
-  const entries = entriesBetween(String(chatId), from, to);
-  if (entries.length === 0) {
+  const text = buildSummaryText(String(chatId), from, to, `Resumen — ${label}`);
+  if (!text) {
     await sendText(chatId, `No tengo anotaciones de ${label}.`);
     return;
   }
-
-  // Aggregate per currency so unlike currencies are never summed together.
-  interface Agg {
-    income: number;
-    expense: number;
-    cats: Map<string, number>;
-  }
-  const byCurrency = new Map<string, Agg>();
-  let pending = 0;
-  for (const e of entries) {
-    if (e.status === "pending") {
-      pending++;
-      continue;
-    }
-    const cur = e.currency || config.defaultCurrency;
-    const agg = byCurrency.get(cur) ?? { income: 0, expense: 0, cats: new Map() };
-    if (e.direction === "income") agg.income += e.amount;
-    else {
-      agg.expense += e.amount;
-      const cat = e.category || "otros";
-      agg.cats.set(cat, (agg.cats.get(cat) ?? 0) + e.amount);
-    }
-    byCurrency.set(cur, agg);
-  }
-
-  const blocks = [...byCurrency.entries()].map(([cur, a]) => {
-    const top = [...a.cats.entries()]
-      .sort((x, y) => y[1] - x[1])
-      .slice(0, 6)
-      .map(([cat, amt]) => `   • ${cat}: ${fmtMoney(amt, cur)}`)
-      .join("\n");
-    return (
-      `🟢 Ingresos: ${fmtMoney(a.income, cur)}\n` +
-      `🔴 Gastos: ${fmtMoney(a.expense, cur)}\n` +
-      `⚖️ Balance: ${fmtMoney(a.income - a.expense, cur)}` +
-      (top ? `\n\nGastos por categoría:\n${top}` : "")
-    );
-  });
-
-  await sendText(
-    chatId,
-    `📊 Resumen — ${label} (${entries.length} anotaciones)\n\n` +
-      blocks.join("\n\n— — —\n\n") +
-      (pending > 0 ? `\n\n⏳ ${pending} movimiento(s) sin monto (ver /pendientes)` : "")
-  );
+  await sendText(chatId, text);
 }
 
 async function handleSearch(
@@ -405,40 +363,46 @@ async function handleDeleteLast(chatId: number): Promise<void> {
   await sendText(chatId, `${header}\n\n${blocks}`);
 }
 
-function csvField(value: string | number | null | undefined): string {
-  const s = value === null || value === undefined ? "" : String(value);
-  return `"${s.replace(/"/g, '""')}"`;
-}
+const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
 async function handleExport(chatId: number): Promise<void> {
-  const entries = allEntries(String(chatId));
-  if (entries.length === 0) {
-    await sendText(chatId, "No hay anotaciones para exportar todavía.");
+  const buffer = await buildWorkbook(String(chatId));
+  await sendDocument(chatId, `cuentas-${localToday()}.xlsx`, buffer, XLSX_MIME);
+  await sendText(chatId, "📄 Listo, te mandé tus cuentas en Excel (hojas: Movimientos y Resumen).");
+}
+
+// Handle a tap on an inline button (currently only "↩️ Deshacer").
+async function handleCallback(cq: CallbackQuery): Promise<void> {
+  const chatId = cq.message?.chat.id;
+  const data = cq.data ?? "";
+  if (chatId === undefined) {
+    await answerCallbackQuery(cq.id);
     return;
   }
-  const header =
-    "fecha,tipo,concepto,monto,moneda,cantidad,unidad,precio_unitario,quien,categoria,anotado_por,estado,nota";
-  const rows = entries.map((e: LedgerEntry) =>
-    [
-      csvField(e.occurredOn),
-      csvField(e.direction === "income" ? "ingreso" : "gasto"),
-      csvField(e.concept),
-      csvField(e.status === "pending" ? "" : e.amount),
-      csvField(e.currency),
-      csvField(e.quantity),
-      csvField(e.unit),
-      csvField(e.unitPrice),
-      csvField(e.counterparty),
-      csvField(e.category),
-      csvField(e.authorName),
-      csvField(e.status === "pending" ? "pendiente" : "registrado"),
-      csvField(e.note),
-    ].join(",")
-  );
-  const csv = "﻿" + [header, ...rows].join("\n"); // BOM so Excel reads UTF-8
-  await sendDocument(chatId, `cuentas-${localToday()}.csv`, csv);
-  await sendText(chatId, `📄 Listo, exporté ${entries.length} anotaciones.`);
+  if (!isAllowed(chatId)) {
+    await answerCallbackQuery(cq.id, "Privado 🔒");
+    return;
+  }
+  if (data.startsWith("undo:")) {
+    const mid = Number(data.slice(5));
+    const removed = deleteBatchByMessage(String(chatId), mid);
+    await answerCallbackQuery(cq.id, removed.length ? "Deshecho" : "Ya no estaba");
+    if (cq.message) await clearButtons(chatId, cq.message.message_id);
+    if (removed.length) {
+      const blocks = removed.map((e) => renderEntry(e)).join("\n\n");
+      await sendText(chatId, `🗑️ Deshice:\n\n${blocks}`);
+    }
+    return;
+  }
+  await answerCallbackQuery(cq.id);
 }
+
+const COMMANDS = [
+  { command: "resumen", description: "Resumen de este mes" },
+  { command: "pendientes", description: "Trabajos sin monto" },
+  { command: "exportar", description: "Bajar todo en Excel" },
+  { command: "ayuda", description: "Cómo usar el bot" },
+];
 
 async function main(): Promise<void> {
   if (!config.telegram.botToken) {
@@ -453,14 +417,25 @@ async function main(): Promise<void> {
     console.warn("WARNING: ALLOWED_CHAT_IDS is empty and ALLOW_ANYONE is not set — denying everyone (fail-closed).");
   }
 
+  await setMyCommands(COMMANDS).catch((e) => console.error("setMyCommands failed:", e));
+
+  // Scheduled reports + credit alerts: check every 30 min (and once now).
+  const tick = () =>
+    Promise.all([runScheduledReports(), checkCredit()]).catch((e) =>
+      console.error("scheduler error:", e)
+    );
+  setInterval(tick, 30 * 60 * 1000);
+  void tick();
+
   let offset = getOffset();
   for (;;) {
     try {
       const updates = await getUpdates(offset);
       for (const update of updates) {
         if (update.message) await handleMessage(update.message);
+        else if (update.callback_query) await handleCallback(update.callback_query);
         offset = update.update_id + 1;
-        setOffset(offset); // advance only after the message is fully handled
+        setOffset(offset); // advance only after the update is fully handled
       }
     } catch (err) {
       console.error("polling error:", err);
