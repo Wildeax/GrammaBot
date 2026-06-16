@@ -24,7 +24,7 @@ export const config = {
   llm: {
     apiKey: optional("LLM_API_KEY", ""),
     baseUrl: optional("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
-    model: optional("LLM_MODEL", "google/gemini-2.5-flash"),
+    model: optional("LLM_MODEL", "google/gemini-2.5-flash-lite"),
   },
 
   // Cheap, fast model used as a first-stage guard (jailbreak / off-topic / abuse).
