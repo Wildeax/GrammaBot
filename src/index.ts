@@ -20,6 +20,7 @@ import {
   entriesBetween,
   searchEntries,
   pendingEntries,
+  recentDuplicate,
   allEntries,
   isProcessed,
   markProcessed,
@@ -76,6 +77,13 @@ function fmtDate(iso: string): string {
   return `${Number(d)} ${MONTHS[mi]} ${y}`;
 }
 
+const UNIT_ABBR = new Set(["kg", "g", "lt", "l", "mt", "m", "cm", "ha", "cc", "ml", "qq"]);
+function pluralizeUnit(unit: string, qty: number): string {
+  if (qty === 1) return unit;
+  if (UNIT_ABBR.has(unit.toLowerCase())) return unit; // kg, ha, … stay as-is
+  return /[aeiouáéíóú]$/i.test(unit) ? `${unit}s` : `${unit}es`; // vocal→s, consonante→es
+}
+
 /** Two-line compact-but-detailed rendering of one entry. */
 function renderEntry(e: EntryFields): string {
   const icon = e.direction === "income" ? "🟢" : "🔴";
@@ -83,7 +91,7 @@ function renderEntry(e: EntryFields): string {
   const detail: string[] = [];
   if (e.concept) detail.push(`📋 ${e.concept}`);
   if (e.quantity && e.unit) {
-    const u = e.quantity === 1 ? e.unit : `${e.unit}es`;
+    const u = pluralizeUnit(e.unit, e.quantity);
     detail.push(`${e.quantity} ${u}${e.unitPrice ? ` × ${fmtAmount(e.unitPrice)} c/u` : ""}`);
   }
   if (e.counterparty) detail.push(`👤 ${e.counterparty}`);
@@ -176,12 +184,25 @@ async function handleTranscribed(
   const { chatId, messageId } = ctx;
   let transcript: string;
   if (fileId) {
-    const { buffer, mimeType } = await downloadFile(fileId);
-    transcript = await transcribe(buffer, mimeType);
+    try {
+      const { buffer, mimeType } = await downloadFile(fileId);
+      transcript = await transcribe(buffer, mimeType);
+    } catch (err) {
+      // Transient transcription/download failure — don't lose it silently.
+      recordFailed(String(chatId), messageId, "[audio no transcrito]", (err as Error).message);
+      await sendText(
+        chatId,
+        "No pude leer tu audio en este momento 😕. Reenviámelo en un momentito, por favor."
+      );
+      return;
+    }
   } else {
     transcript = typedText ?? "";
   }
-  if (!transcript.trim()) return;
+  if (!transcript.trim()) {
+    if (fileId) await sendText(chatId, "No te escuché bien 🙉. ¿Me lo repetís?");
+    return;
+  }
   if (config.debug) console.log(`transcript chat=${chatId}: ${transcript}`);
 
   // First-stage guard: reject jailbreak / off-topic / abuse cheaply before the main model.
@@ -209,6 +230,11 @@ async function handleTranscribed(
 
   switch (action.intent) {
     case "entries": {
+      // Guard against a user resending the same note after a swallowed confirmation failure.
+      if (recentDuplicate(String(chatId), transcript)) {
+        await sendText(chatId, "Eso ya lo había anotado hace un ratico 👍 (no lo dupliqué).");
+        break;
+      }
       recordEntries(
         {
           chatId: String(chatId),
@@ -279,37 +305,48 @@ async function handleSummary(
     return;
   }
 
-  const currency = entries.find((e) => e.currency)?.currency || config.defaultCurrency;
-  let income = 0;
-  let expense = 0;
+  // Aggregate per currency so unlike currencies are never summed together.
+  interface Agg {
+    income: number;
+    expense: number;
+    cats: Map<string, number>;
+  }
+  const byCurrency = new Map<string, Agg>();
   let pending = 0;
-  const byCategory = new Map<string, number>();
   for (const e of entries) {
     if (e.status === "pending") {
       pending++;
       continue;
     }
-    if (e.direction === "income") income += e.amount;
+    const cur = e.currency || config.defaultCurrency;
+    const agg = byCurrency.get(cur) ?? { income: 0, expense: 0, cats: new Map() };
+    if (e.direction === "income") agg.income += e.amount;
     else {
-      expense += e.amount;
+      agg.expense += e.amount;
       const cat = e.category || "otros";
-      byCategory.set(cat, (byCategory.get(cat) ?? 0) + e.amount);
+      agg.cats.set(cat, (agg.cats.get(cat) ?? 0) + e.amount);
     }
+    byCurrency.set(cur, agg);
   }
 
-  const topCategories = [...byCategory.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([cat, amt]) => `   • ${cat}: ${fmtMoney(amt, currency)}`)
-    .join("\n");
+  const blocks = [...byCurrency.entries()].map(([cur, a]) => {
+    const top = [...a.cats.entries()]
+      .sort((x, y) => y[1] - x[1])
+      .slice(0, 6)
+      .map(([cat, amt]) => `   • ${cat}: ${fmtMoney(amt, cur)}`)
+      .join("\n");
+    return (
+      `🟢 Ingresos: ${fmtMoney(a.income, cur)}\n` +
+      `🔴 Gastos: ${fmtMoney(a.expense, cur)}\n` +
+      `⚖️ Balance: ${fmtMoney(a.income - a.expense, cur)}` +
+      (top ? `\n\nGastos por categoría:\n${top}` : "")
+    );
+  });
 
   await sendText(
     chatId,
     `📊 Resumen — ${label} (${entries.length} anotaciones)\n\n` +
-      `🟢 Ingresos: ${fmtMoney(income, currency)}\n` +
-      `🔴 Gastos: ${fmtMoney(expense, currency)}\n` +
-      `⚖️ Balance: ${fmtMoney(income - expense, currency)}` +
-      (topCategories ? `\n\nGastos por categoría:\n${topCategories}` : "") +
+      blocks.join("\n\n— — —\n\n") +
       (pending > 0 ? `\n\n⏳ ${pending} movimiento(s) sin monto (ver /pendientes)` : "")
   );
 }
@@ -323,15 +360,23 @@ async function handleSearch(
     await sendText(chatId, `No encontré nada sobre ${filters.label}.`);
     return;
   }
-  const currency = results.find((e) => e.currency)?.currency || config.defaultCurrency;
-  const total = results
-    .filter((e) => e.status !== "pending")
-    .reduce((s, e) => s + (e.direction === "expense" ? e.amount : 0), 0);
+  // Expense totals per currency (never mix currencies into one number).
+  const totals = new Map<string, number>();
+  for (const e of results) {
+    if (e.status !== "pending" && e.direction === "expense") {
+      const cur = e.currency || config.defaultCurrency;
+      totals.set(cur, (totals.get(cur) ?? 0) + e.amount);
+    }
+  }
+  const totalsLines = [...totals.entries()]
+    .filter(([, v]) => v > 0)
+    .map(([cur, v]) => `Total gastos: ${fmtMoney(v, cur)}`)
+    .join("\n");
   const blocks = results.map((e) => renderEntry(e)).join("\n\n");
   await sendText(
     chatId,
     `🔎 ${filters.label} — ${results.length} resultado(s):\n\n${blocks}` +
-      (total > 0 ? `\n\nTotal gastos en estos: ${fmtMoney(total, currency)}` : "")
+      (totalsLines ? `\n\n${totalsLines}` : "")
   );
 }
 

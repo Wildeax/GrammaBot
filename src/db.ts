@@ -253,6 +253,17 @@ export function allEntries(chatId: string): LedgerEntry[] {
     .all(chatId) as LedgerEntry[];
 }
 
+/** True if an identical transcript was already recorded for this chat in the last 10 min. */
+export function recentDuplicate(chatId: string, rawTranscript: string): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM ledger
+       WHERE chat_id = ? AND raw_transcript = ? AND deleted_at IS NULL
+         AND created_at >= datetime('now', '-600 seconds') LIMIT 1`
+    )
+    .get(chatId, rawTranscript);
+}
+
 /** Pending entries (no amount yet), oldest first — same order shown to the user. */
 export function pendingEntries(chatId: string): LedgerEntry[] {
   return db
@@ -316,8 +327,10 @@ export function completePending(
   if (pend.length === 0) return { completed: null, hadPending: false };
 
   let target: LedgerEntry | undefined;
-  if (opts.which && opts.which >= 1 && opts.which <= pend.length) {
-    target = pend[opts.which - 1];
+  if (opts.which != null) {
+    // Explicit ordinal: if it's out of range, don't guess — ask the user again.
+    if (opts.which >= 1 && opts.which <= pend.length) target = pend[opts.which - 1];
+    else return { completed: null, hadPending: true };
   } else if (opts.counterparty) {
     const cp = opts.counterparty.toLowerCase();
     const matches = pend.filter((p) => (p.counterparty || "").toLowerCase().includes(cp));
@@ -325,16 +338,17 @@ export function completePending(
   }
   if (!target) target = pend[pend.length - 1]; // most recent pending
 
+  // Derive a per-unit price when the pending row had a quantity (e.g. "3 jornales").
+  let unitPrice = opts.unitPrice ?? null;
+  if (unitPrice === null && target.quantity && target.quantity > 0) {
+    unitPrice = Math.round(amount / target.quantity);
+  }
+
   db.prepare(
     `UPDATE ledger
        SET amount = ?, unit_price = COALESCE(?, unit_price), status = 'recorded'
      WHERE id = ? AND chat_id = ? AND status = 'pending' AND deleted_at IS NULL`
-  ).run(
-    Math.round(amount),
-    opts.unitPrice === null || opts.unitPrice === undefined ? null : Math.round(opts.unitPrice),
-    target.id,
-    chatId
-  );
+  ).run(Math.round(amount), unitPrice === null ? null : Math.round(unitPrice), target.id, chatId);
 
   const updated = db
     .prepare(`SELECT ${SELECT_COLUMNS} FROM ledger WHERE id = ?`)

@@ -88,6 +88,25 @@ check("all entries gone after delete", db.allEntries(CHAT).length === 0);
 db.markProcessed(CHAT, 1);
 check("re-mark idempotent", db.isProcessed(CHAT, 1) === true);
 
+console.log(`\n# regression fixes`);
+// duplicate detection
+const CHAT2 = "888";
+const dupEntries = [{ direction: "expense", amount: 5000, currency: "COP", concept: "gas", category: "servicios", quantity: null, unit: null, unitPrice: null, counterparty: null, note: null, occurredOn: today, status: "recorded" }];
+db.recordEntries({ chatId: CHAT2, messageId: 10, authorUserId: null, authorName: null, rawTranscript: "gasté 5 mil de gas" }, dupEntries);
+check("recentDuplicate detects same transcript", db.recentDuplicate(CHAT2, "gasté 5 mil de gas") === true);
+check("recentDuplicate ignores different transcript", db.recentDuplicate(CHAT2, "otra cosa distinta") === false);
+
+// completePending out-of-range index -> does not complete, reports hadPending
+const CHAT3 = "777";
+db.recordEntries({ chatId: CHAT3, messageId: 11, authorUserId: null, authorName: null, rawTranscript: "x" }, [
+  { direction: "expense", amount: 0, currency: "COP", concept: "jornal Wilfer", category: "mano de obra", quantity: 3, unit: "jornal", unitPrice: null, counterparty: "Wilfer", note: null, occurredOn: today, status: "pending" },
+]);
+const badWhich = db.completePending(CHAT3, 100000, { which: 9 });
+check("out-of-range which does NOT complete", badWhich.completed === null && badWhich.hadPending === true, JSON.stringify(badWhich));
+// proper completion derives unitPrice from quantity (3) -> 100000/3 rounded
+const okComplete = db.completePending(CHAT3, 300000, { which: 1 });
+check("completion derives unitPrice 300000/3=100000", okComplete.completed && okComplete.completed.unitPrice === 100000, JSON.stringify(okComplete.completed));
+
 console.log(`\n# money parsing edge (string with separators)`);
 const a5 = await interpret('anota un gasto de "1.500.000" en abono', today);
 if (a5.intent === "entries") {
