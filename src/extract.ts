@@ -9,11 +9,12 @@ export type ExtractedEntry = Omit<
 >;
 
 const SYSTEM_PROMPT = `Eres un asistente de contabilidad. Recibes lo que una persona dijo
-en una nota de voz y devuelves UNA anotación contable en JSON estricto.
+en una nota de voz (o escribió) y devuelves UNA anotación contable en JSON estricto.
 
 Devuelve SOLO un objeto JSON con estas claves:
-- "direction": "income" si entró dinero, "expense" si salió dinero.
-- "amount": número positivo (sin separadores de miles, punto decimal).
+- "direction": "income" si entró dinero, "expense" si salió dinero, o "none" si el
+  mensaje NO describe un movimiento de dinero (saludo, pregunta, comando, charla, etc.).
+- "amount": número positivo (sin separadores de miles, punto decimal). 0 si "none".
 - "currency": código ISO de 3 letras si se menciona; si no, usa "ARS".
 - "category": categoría corta (ej. "gas", "ventas", "sueldo") o null.
 - "counterparty": nombre de la persona/empresa involucrada o null.
@@ -22,10 +23,14 @@ Devuelve SOLO un objeto JSON con estas claves:
 
 No incluyas texto fuera del JSON.`;
 
+/**
+ * Extract a ledger entry from free-form text.
+ * Returns null when the message isn't a money movement (greeting, question, etc.).
+ */
 export async function extractEntry(
   transcript: string,
   today: string
-): Promise<ExtractedEntry> {
+): Promise<ExtractedEntry | null> {
   if (!config.llm.apiKey) {
     throw new Error("LLM_API_KEY is not set");
   }
@@ -56,9 +61,9 @@ export async function extractEntry(
   };
   const parsed = JSON.parse(data.choices[0].message.content) as ExtractedEntry;
 
-  // Minimal validation / normalization.
+  // Not a money movement — nothing to record.
   if (parsed.direction !== "income" && parsed.direction !== "expense") {
-    throw new Error(`Invalid direction from model: ${parsed.direction}`);
+    return null;
   }
   parsed.amount = Math.abs(Number(parsed.amount));
   parsed.currency = (parsed.currency || "ARS").toUpperCase();

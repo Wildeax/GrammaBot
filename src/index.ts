@@ -11,11 +11,21 @@ import { transcribe } from "./transcribe.js";
 import { extractEntry } from "./extract.js";
 import { insertEntry } from "./db.js";
 
+const WELCOME =
+  "¡Hola! Soy tu asistente de cuentas 🧾\n\n" +
+  "Contame por audio o por texto lo que gastaste o cobraste y yo lo anoto.\n\n" +
+  "Por ejemplo:\n" +
+  '• "Gasté 5000 de gas hoy"\n' +
+  '• "Cobré 20000 del cliente Pérez"\n\n' +
+  "Mandame una nota de voz cuando quieras 🙂";
+
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const chatId = msg.chat.id;
   try {
     const voice = msg.voice ?? msg.audio;
-    if (voice) {
+    if (msg.text && msg.text.trim().toLowerCase().startsWith("/start")) {
+      await sendText(chatId, WELCOME);
+    } else if (voice) {
       await handleEntry(chatId, voice.file_id);
     } else if (msg.text) {
       await handleEntry(chatId, null, msg.text); // allow typed entries too
@@ -44,6 +54,15 @@ async function handleEntry(
 
   const today = new Date().toISOString().slice(0, 10);
   const extracted = await extractEntry(transcript, today);
+
+  if (!extracted) {
+    await sendText(
+      chatId,
+      `No encontré un gasto o ingreso en eso 🤔\n` +
+        `Probá contándome algo como "gasté 5000 de gas" o "cobré 20000 de Pérez".`
+    );
+    return;
+  }
 
   insertEntry({
     chatId: String(chatId),
