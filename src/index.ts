@@ -284,12 +284,25 @@ async function handleTranscribed(
     case "delete_last":
       await handleDeleteLast(chatId);
       break;
+    case "export":
+      await handleExport(chatId);
+      break;
+    case "help":
+      await sendText(chatId, WELCOME);
+      break;
+    case "chat":
+      await sendText(
+        chatId,
+        action.reply ||
+          "¡Hola! 🙂 Contame qué gastaste o qué te entró y lo anoto. Por ejemplo: \"pagué 50 mil al jornalero\"."
+      );
+      break;
     case "none":
       await sendText(
         chatId,
-        "No entendí bien eso 🤔\n" +
-          'Probá con algo como "pagué 100 mil a Danilo por un jornal de siembra" o\n' +
-          '"¿cuánto gasté este mes?".'
+        "Perdoná, no te entendí bien 🙂\n" +
+          'Contame un gasto o ingreso (ej: "pagué 50 mil al jornalero"), pedime un resumen ' +
+          '("¿cuánto gasté este mes?") o escribí /ayuda.'
       );
       break;
   }

@@ -236,9 +236,13 @@ export function searchEntries(
   const params: unknown[] = [chatId];
 
   if (filters.text) {
-    where.push("(concept LIKE ? OR note LIKE ? OR counterparty LIKE ? OR category LIKE ?)");
+    // Search the original words too (raw_transcript) so "jornales" finds an entry whose
+    // concept is "Preparación del terreno" but whose dictation said "jornales".
+    where.push(
+      "(concept LIKE ? OR note LIKE ? OR counterparty LIKE ? OR category LIKE ? OR unit LIKE ? OR raw_transcript LIKE ?)"
+    );
     const like = `%${filters.text}%`;
-    params.push(like, like, like, like);
+    params.push(like, like, like, like, like, like);
   }
   if (filters.counterparty) {
     where.push("counterparty LIKE ?");
