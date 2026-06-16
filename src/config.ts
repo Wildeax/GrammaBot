@@ -12,14 +12,14 @@ export const config = {
 
   transcribe: {
     apiKey: optional("TRANSCRIBE_API_KEY", ""),
-    baseUrl: optional("TRANSCRIBE_BASE_URL", "https://api.openai.com/v1"),
-    model: optional("TRANSCRIBE_MODEL", "whisper-1"),
+    baseUrl: optional("TRANSCRIBE_BASE_URL", "https://openrouter.ai/api/v1"),
+    model: optional("TRANSCRIBE_MODEL", "openai/gpt-4o-mini-transcribe"),
   },
 
   llm: {
     apiKey: optional("LLM_API_KEY", ""),
-    baseUrl: optional("LLM_BASE_URL", "https://api.openai.com/v1"),
-    model: optional("LLM_MODEL", "gpt-4o-mini"),
+    baseUrl: optional("LLM_BASE_URL", "https://openrouter.ai/api/v1"),
+    model: optional("LLM_MODEL", "google/gemini-2.5-flash"),
   },
 
   defaultLanguage: optional("DEFAULT_LANGUAGE", "es"),

@@ -1,10 +1,23 @@
-// Speech-to-text for WhatsApp voice notes, via an OpenAI-compatible Whisper endpoint.
+// Speech-to-text for voice notes.
+//
+// Uses the OpenRouter-style transcription endpoint, which takes JSON with
+// base64-encoded audio (NOT a multipart file upload). Works with any provider
+// exposing /audio/transcriptions in this shape.
 
 import { config } from "./config.js";
 
+/** Map a MIME type to the short format string the API expects. */
+function formatFromMime(mimeType: string): string {
+  const sub = mimeType.split("/")[1] ?? "ogg";
+  // Telegram voice notes are audio/ogg (Opus); the API expects "ogg".
+  if (sub.includes("ogg") || sub.includes("oga")) return "ogg";
+  if (sub.includes("mpeg") || sub.includes("mp3")) return "mp3";
+  return sub;
+}
+
 /**
  * Transcribe an audio buffer to text.
- * @param audio  Raw audio bytes (e.g. an OGG/Opus WhatsApp voice note).
+ * @param audio  Raw audio bytes (e.g. an OGG/Opus voice note).
  * @param mimeType  MIME type of the audio, e.g. "audio/ogg".
  */
 export async function transcribe(audio: Buffer, mimeType = "audio/ogg"): Promise<string> {
@@ -12,16 +25,19 @@ export async function transcribe(audio: Buffer, mimeType = "audio/ogg"): Promise
     throw new Error("TRANSCRIBE_API_KEY is not set");
   }
 
-  const form = new FormData();
-  const ext = mimeType.split("/")[1] ?? "ogg";
-  form.append("file", new Blob([new Uint8Array(audio)], { type: mimeType }), `voice.${ext}`);
-  form.append("model", config.transcribe.model);
-  form.append("language", config.defaultLanguage);
-
   const res = await fetch(`${config.transcribe.baseUrl}/audio/transcriptions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${config.transcribe.apiKey}` },
-    body: form,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.transcribe.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: config.transcribe.model,
+      input_audio: {
+        data: audio.toString("base64"),
+        format: formatFromMime(mimeType),
+      },
+    }),
   });
 
   if (!res.ok) {
