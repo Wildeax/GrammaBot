@@ -1,5 +1,5 @@
 // Telegram bot: long-polls for messages, interprets them, and acts
-// (record entry / show summary / delete last / export CSV).
+// (record entries / summary / search / delete last / export CSV).
 
 import { config } from "./config.js";
 import {
@@ -10,11 +10,13 @@ import {
   type TelegramMessage,
 } from "./telegram.js";
 import { transcribe } from "./transcribe.js";
-import { interpret, type Period } from "./extract.js";
+import { interpret } from "./extract.js";
 import {
   insertEntry,
   deleteLast,
-  entriesSince,
+  entriesBetween,
+  searchEntries,
+  pendingEntries,
   allEntries,
   type LedgerEntry,
 } from "./db.js";
@@ -23,51 +25,54 @@ const WELCOME =
   "¡Hola! Soy tu asistente de cuentas 🧾\n\n" +
   "Contame por audio o por texto lo que gastaste o te entró, y yo lo anoto.\n\n" +
   "Por ejemplo:\n" +
-  '• "Gasté 5 lucas de gas hoy"\n' +
-  '• "Me entraron 20 mil de doña Marta"\n\n' +
+  '• "El 17 de mayo pagué 300 mil de jornales, preparación del terreno: 3 jornales a 100 mil c/u"\n' +
+  '• "Hoy Danilo sembró maíz, 1 jornal de 100 mil"\n\n' +
   "También podés decirme:\n" +
-  '• "¿Cuánto gasté este mes?" — para un resumen\n' +
+  '• "¿Cuánto gasté en enero?" — resumen de cualquier mes\n' +
+  '• "¿Cuánto le pagué a Danilo?" — buscar movimientos\n' +
   '• "Borrá lo último" — si te equivocaste\n' +
-  "• /exportar — para bajar todo en un archivo de Excel\n\n" +
+  "• /pendientes — trabajos sin monto\n" +
+  "• /exportar — bajar todo en un archivo de Excel\n\n" +
   "Mandame una nota de voz cuando quieras 🙂";
 
-const HELP = WELCOME;
+// --- formatting helpers ---------------------------------------------------
 
-// --- money + date helpers -------------------------------------------------
+const MONTHS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
 
-function fmtMoney(amount: number, currency: string): string {
-  return `$${Math.round(amount).toLocaleString("es-CO")} ${currency}`;
+function fmtAmount(n: number): string {
+  return `$${Math.round(n).toLocaleString("es-CO")}`;
 }
-
+function fmtMoney(amount: number, currency: string): string {
+  return `${fmtAmount(amount)} ${currency}`;
+}
+function fmtDate(iso: string): string {
+  const [y, m, d] = iso.split("-");
+  const mi = Number(m) - 1;
+  if (!y || mi < 0 || mi > 11) return iso;
+  return `${Number(d)} ${MONTHS[mi]} ${y}`;
+}
 function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
-
-function sinceDate(period: Period): string {
-  const now = new Date();
-  switch (period) {
-    case "today":
-      return today();
-    case "week": {
-      const d = new Date(now);
-      d.setDate(d.getDate() - 6);
-      return d.toISOString().slice(0, 10);
-    }
-    case "month":
-      return `${now.toISOString().slice(0, 7)}-01`;
-    case "all":
-      return "0000-01-01";
-  }
+function monthStart(): string {
+  return `${new Date().toISOString().slice(0, 7)}-01`;
 }
 
-const PERIOD_LABEL: Record<Period, string> = {
-  today: "hoy",
-  week: "esta semana",
-  month: "este mes",
-  all: "en total",
-};
+/** Two-line compact-but-detailed rendering of one entry. */
+function renderEntry(e: LedgerEntry): string {
+  const icon = e.direction === "income" ? "🟢" : "🔴";
+  const money = e.status === "pending" ? "⏳ Pendiente" : `${icon} ${fmtMoney(e.amount, e.currency)}`;
+  const detail: string[] = [];
+  if (e.concept) detail.push(`📋 ${e.concept}`);
+  if (e.quantity && e.unit) {
+    const u = e.quantity === 1 ? e.unit : `${e.unit}es`;
+    detail.push(`${e.quantity} ${u}${e.unitPrice ? ` × ${fmtAmount(e.unitPrice)} c/u` : ""}`);
+  }
+  if (e.counterparty) detail.push(`👤 ${e.counterparty}`);
+  return `${fmtDate(e.occurredOn)} · ${money}\n${detail.join(" · ")}`.trim();
+}
 
-// --- handlers -------------------------------------------------------------
+// --- access control -------------------------------------------------------
 
 function isAllowed(chatId: number): boolean {
   return (
@@ -76,18 +81,18 @@ function isAllowed(chatId: number): boolean {
   );
 }
 
+// --- message dispatch -----------------------------------------------------
+
 async function handleMessage(msg: TelegramMessage): Promise<void> {
   const chatId = msg.chat.id;
   const text = msg.text?.trim() ?? "";
   console.log(`message from chat ${chatId}: ${msg.voice ? "[voice]" : text}`);
 
   try {
-    // Always available, even when locked, so a user can report their ID.
     if (text.toLowerCase().startsWith("/miid")) {
       await sendText(chatId, `Tu ID de chat es: ${chatId}`);
       return;
     }
-
     if (!isAllowed(chatId)) {
       await sendText(chatId, "Este asistente es privado 🔒");
       return;
@@ -95,11 +100,13 @@ async function handleMessage(msg: TelegramMessage): Promise<void> {
 
     const lower = text.toLowerCase();
     if (lower.startsWith("/start") || lower.startsWith("/help") || lower.startsWith("/ayuda")) {
-      await sendText(chatId, HELP);
+      await sendText(chatId, WELCOME);
     } else if (lower.startsWith("/export") || lower.startsWith("/exportar")) {
       await handleExport(chatId);
+    } else if (lower.startsWith("/pendientes")) {
+      await handlePending(chatId);
     } else if (lower.startsWith("/resumen")) {
-      await handleSummary(chatId, "month");
+      await handleSummary(chatId, monthStart(), today(), "este mes");
     } else if (msg.voice ?? msg.audio) {
       await handleTranscribed(chatId, (msg.voice ?? msg.audio)!.file_id);
     } else if (text) {
@@ -132,24 +139,26 @@ async function handleTranscribed(
 
   switch (action.intent) {
     case "entries": {
-      const lines = action.entries.map((e) => {
+      const blocks = action.entries.map((e) => {
         insertEntry({ chatId: String(chatId), rawTranscript: transcript, ...e });
-        const icon = e.direction === "income" ? "🟢 Ingreso" : "🔴 Gasto";
-        return (
-          `${icon} de ${fmtMoney(e.amount, e.currency)}` +
-          (e.category ? ` (${e.category})` : "") +
-          (e.counterparty ? ` — ${e.counterparty}` : "")
-        );
+        return renderEntry(e as LedgerEntry);
       });
+      const pendingCount = action.entries.filter((e) => e.status === "pending").length;
       const header =
         action.entries.length > 1
           ? `✅ Anoté ${action.entries.length} movimientos:`
           : "✅ Anotado:";
-      await sendText(chatId, `${header}\n${lines.join("\n")}`);
+      let footer = "";
+      if (pendingCount > 0)
+        footer = `\n\n⏳ ${pendingCount} sin monto. Cuando sepas cuánto fue, contame y lo completás.`;
+      await sendText(chatId, `${header}\n\n${blocks.join("\n\n")}${footer}`);
       break;
     }
     case "summary":
-      await handleSummary(chatId, action.period);
+      await handleSummary(chatId, action.from, action.to, action.label);
+      break;
+    case "search":
+      await handleSearch(chatId, action);
       break;
     case "delete_last":
       await handleDeleteLast(chatId);
@@ -157,25 +166,36 @@ async function handleTranscribed(
     case "none":
       await sendText(
         chatId,
-        "No encontré un gasto o ingreso en eso 🤔\n" +
-          'Probá con algo como "gasté 5 lucas de gas" o "me entraron 20 mil de Marta".'
+        "No entendí bien eso 🤔\n" +
+          'Probá con algo como "pagué 100 mil a Danilo por un jornal de siembra" o\n' +
+          '"¿cuánto gasté este mes?".'
       );
       break;
   }
 }
 
-async function handleSummary(chatId: number, period: Period): Promise<void> {
-  const entries = entriesSince(String(chatId), sinceDate(period));
+async function handleSummary(
+  chatId: number,
+  from: string,
+  to: string,
+  label: string
+): Promise<void> {
+  const entries = entriesBetween(String(chatId), from, to);
   if (entries.length === 0) {
-    await sendText(chatId, `No tengo anotaciones ${PERIOD_LABEL[period]} todavía.`);
+    await sendText(chatId, `No tengo anotaciones de ${label}.`);
     return;
   }
 
-  const currency = entries[0].currency || config.defaultCurrency;
+  const currency = entries.find((e) => e.currency)?.currency || config.defaultCurrency;
   let income = 0;
   let expense = 0;
+  let pending = 0;
   const byCategory = new Map<string, number>();
   for (const e of entries) {
+    if (e.status === "pending") {
+      pending++;
+      continue;
+    }
     if (e.direction === "income") income += e.amount;
     else {
       expense += e.amount;
@@ -186,17 +206,53 @@ async function handleSummary(chatId: number, period: Period): Promise<void> {
 
   const topCategories = [...byCategory.entries()]
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
+    .slice(0, 6)
     .map(([cat, amt]) => `   • ${cat}: ${fmtMoney(amt, currency)}`)
     .join("\n");
 
   await sendText(
     chatId,
-    `📊 Resumen ${PERIOD_LABEL[period]} (${entries.length} anotaciones)\n\n` +
+    `📊 Resumen — ${label} (${entries.length} anotaciones)\n\n` +
       `🟢 Ingresos: ${fmtMoney(income, currency)}\n` +
       `🔴 Gastos: ${fmtMoney(expense, currency)}\n` +
       `⚖️ Balance: ${fmtMoney(income - expense, currency)}` +
-      (topCategories ? `\n\nGastos por categoría:\n${topCategories}` : "")
+      (topCategories ? `\n\nGastos por categoría:\n${topCategories}` : "") +
+      (pending > 0 ? `\n\n⏳ ${pending} movimiento(s) sin monto (ver /pendientes)` : "")
+  );
+}
+
+async function handleSearch(
+  chatId: number,
+  filters: { text: string | null; counterparty: string | null; from: string | null; to: string | null; label: string }
+): Promise<void> {
+  const results = searchEntries(String(chatId), filters);
+  if (results.length === 0) {
+    await sendText(chatId, `No encontré nada sobre ${filters.label}.`);
+    return;
+  }
+  const currency = results.find((e) => e.currency)?.currency || config.defaultCurrency;
+  const total = results
+    .filter((e) => e.status !== "pending")
+    .reduce((s, e) => s + (e.direction === "expense" ? e.amount : 0), 0);
+  const blocks = results.map((e) => renderEntry(e)).join("\n\n");
+  await sendText(
+    chatId,
+    `🔎 ${filters.label} — ${results.length} resultado(s):\n\n${blocks}` +
+      (total > 0 ? `\n\nTotal gastos en estos: ${fmtMoney(total, currency)}` : "")
+  );
+}
+
+async function handlePending(chatId: number): Promise<void> {
+  const items = pendingEntries(String(chatId));
+  if (items.length === 0) {
+    await sendText(chatId, "No tenés trabajos pendientes de monto 👍");
+    return;
+  }
+  const blocks = items.map((e) => renderEntry(e)).join("\n\n");
+  await sendText(
+    chatId,
+    `⏳ ${items.length} sin monto:\n\n${blocks}\n\n` +
+      "Cuando sepas cuánto fue cada uno, contámelo (ej: \"a Wilfer le pagué 100 mil\")."
   );
 }
 
@@ -206,16 +262,11 @@ async function handleDeleteLast(chatId: number): Promise<void> {
     await sendText(chatId, "No hay nada para borrar.");
     return;
   }
-  const sign = removed.direction === "income" ? "Ingreso" : "Gasto";
-  await sendText(
-    chatId,
-    `🗑️ Borré la última anotación: ${sign} de ${fmtMoney(removed.amount, removed.currency)}` +
-      (removed.category ? ` (${removed.category})` : "")
-  );
+  await sendText(chatId, `🗑️ Borré la última anotación:\n\n${renderEntry(removed)}`);
 }
 
 function csvField(value: string | number | null): string {
-  const s = value === null ? "" : String(value);
+  const s = value === null || value === undefined ? "" : String(value);
   return `"${s.replace(/"/g, '""')}"`;
 }
 
@@ -225,15 +276,21 @@ async function handleExport(chatId: number): Promise<void> {
     await sendText(chatId, "No hay anotaciones para exportar todavía.");
     return;
   }
-  const header = "fecha,tipo,monto,moneda,categoria,quien,nota";
-  const rows = entries.map((e: LedgerEntry) =>
+  const header =
+    "fecha,tipo,concepto,monto,moneda,cantidad,unidad,precio_unitario,quien,categoria,estado,nota";
+  const rows = entries.map((e) =>
     [
       csvField(e.occurredOn),
       csvField(e.direction === "income" ? "ingreso" : "gasto"),
-      csvField(e.amount),
+      csvField(e.concept),
+      csvField(e.status === "pending" ? "" : e.amount),
       csvField(e.currency),
-      csvField(e.category),
+      csvField(e.quantity),
+      csvField(e.unit),
+      csvField(e.unitPrice),
       csvField(e.counterparty),
+      csvField(e.category),
+      csvField(e.status === "pending" ? "pendiente" : "registrado"),
       csvField(e.note),
     ].join(",")
   );
