@@ -135,6 +135,13 @@ check("editLast updates amount", edited && edited.amount === 200000, JSON.string
 const reports = await import("../dist/reports.js");
 const sumText = reports.buildSummaryText(CHAT4, "0000-01-01", today, "Test");
 check("buildSummaryText returns text", typeof sumText === "string" && sumText.includes("Gastos"), String(sumText).slice(0, 60));
+// "otros meses" hint: an entry dated last year is outside a current-month range.
+db.recordEntries({ chatId: CHAT4, messageId: 21, authorUserId: null, authorName: null, rawTranscript: "z" }, [
+  { direction: "expense", amount: 1000, currency: "COP", concept: "viejo", category: "otros", quantity: null, unit: null, unitPrice: null, counterparty: null, note: null, occurredOn: "2025-01-05", status: "recorded" },
+]);
+const monthText = reports.buildSummaryText(CHAT4, today.slice(0, 7) + "-01", today, "este mes");
+check("summary hints about other months", monthText.includes("otras fechas"), String(monthText).slice(-80));
+check("hasEntriesOutside true for current month", db.hasEntriesOutside(CHAT4, today.slice(0, 7) + "-01", today) === true);
 const wb = await reports.buildWorkbook(CHAT4);
 check("buildWorkbook returns bytes", wb && wb.length > 1000, `len=${wb && wb.length}`);
 const pdf = await reports.buildPdf(CHAT4);

@@ -275,6 +275,16 @@ export function allEntries(chatId: string): LedgerEntry[] {
     .all(chatId) as LedgerEntry[];
 }
 
+/** True if the chat has (non-deleted) entries dated outside the given [from,to] range. */
+export function hasEntriesOutside(chatId: string, from: string, to: string): boolean {
+  return !!db
+    .prepare(
+      `SELECT 1 FROM ledger
+       WHERE chat_id = ? AND deleted_at IS NULL AND (occurred_on < ? OR occurred_on > ?) LIMIT 1`
+    )
+    .get(chatId, from, to);
+}
+
 /** True if an identical transcript was already recorded for this chat in the last 10 min. */
 export function recentDuplicate(chatId: string, rawTranscript: string): boolean {
   return !!db

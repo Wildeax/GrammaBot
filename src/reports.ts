@@ -8,6 +8,7 @@ import {
   entriesBetween,
   allEntries,
   distinctChatIds,
+  hasEntriesOutside,
   metaGet,
   metaSet,
   type LedgerEntry,
@@ -70,10 +71,16 @@ export function buildSummaryText(
     );
   });
 
+  // Warn when there's money in other months, so a back-dated entry doesn't seem "missing".
+  const outside = hasEntriesOutside(chatId, from, to)
+    ? `\n\nℹ️ Tenés movimientos en otras fechas, fuera de ${label}. Pedime "el resumen de todo" para ver el total.`
+    : "";
+
   return (
     `📊 ${label} (${entries.length} anotaciones)\n\n` +
     blocks.join("\n\n— — —\n\n") +
-    (pending > 0 ? `\n\n⏳ ${pending} movimiento(s) sin monto (ver /pendientes)` : "")
+    (pending > 0 ? `\n\n⏳ ${pending} movimiento(s) sin monto (ver /pendientes)` : "") +
+    outside
   );
 }
 
