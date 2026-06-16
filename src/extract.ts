@@ -171,49 +171,50 @@ function toEntry(raw: RawEntry, today: string): EntryFields | null {
   };
 }
 
+/** One model round-trip + parse. Throws on network/non-ok/empty/invalid JSON. */
+async function callModel(transcript: string, today: string): Promise<RawAction> {
+  const res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${config.llm.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: config.llm.model,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT.replaceAll("{{today}}", today) },
+        { role: "user", content: transcript },
+      ],
+    }),
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error(`LLM returned ${res.status}`);
+  const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+  let content = data.choices?.[0]?.message?.content;
+  if (!content || typeof content !== "string") throw new Error("empty model content");
+  content = content.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  const raw = JSON.parse(content);
+  return Array.isArray(raw) ? { intent: "entries", entries: raw } : raw;
+}
+
 export async function interpret(transcript: string, today: string): Promise<Action> {
   if (!config.llm.apiKey) throw new Error("LLM_API_KEY is not set");
 
-  let res: Response;
-  try {
-    res = await fetch(`${config.llm.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.llm.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.llm.model,
-        temperature: 0,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT.replaceAll("{{today}}", today) },
-          { role: "user", content: transcript },
-        ],
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-  } catch (err) {
-    throw new InterpretError(`LLM request failed: ${(err as Error).message}`);
-  }
-
-  if (!res.ok) {
-    throw new InterpretError(`LLM returned ${res.status}: ${await res.text().catch(() => "")}`);
-  }
-
-  let parsed: RawAction;
-  try {
-    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    let content = data.choices?.[0]?.message?.content;
-    if (!content || typeof content !== "string") {
-      throw new Error("empty model content");
+  // Retry once: the model occasionally returns an empty/truncated body (transient).
+  let parsed: RawAction | undefined;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      parsed = await callModel(transcript, today);
+      break;
+    } catch (err) {
+      lastErr = err;
     }
-    // Strip accidental ```json fences before parsing.
-    content = content.trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
-    const raw = JSON.parse(content);
-    parsed = Array.isArray(raw) ? { intent: "entries", entries: raw } : raw;
-  } catch (err) {
-    throw new InterpretError(`Could not parse model output: ${(err as Error).message}`);
+  }
+  if (!parsed) {
+    throw new InterpretError(`Could not interpret message: ${(lastErr as Error)?.message ?? ""}`);
   }
 
   if (parsed.intent === "complete_pending") {
