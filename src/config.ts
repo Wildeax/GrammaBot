@@ -23,5 +23,12 @@ export const config = {
   },
 
   defaultLanguage: optional("DEFAULT_LANGUAGE", "es"),
+  defaultCurrency: optional("DEFAULT_CURRENCY", "COP"),
   databasePath: optional("DATABASE_PATH", "./grammabot.sqlite"),
+
+  // Comma-separated Telegram chat IDs allowed to use the bot. Empty = open to anyone.
+  allowedChatIds: optional("ALLOWED_CHAT_IDS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 };

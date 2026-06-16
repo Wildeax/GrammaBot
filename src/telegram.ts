@@ -35,6 +35,22 @@ export async function sendText(chatId: number, text: string): Promise<void> {
   await call("sendMessage", { chat_id: chatId, text });
 }
 
+/** Send an in-memory file (e.g. a CSV) to a chat as a document. */
+export async function sendDocument(
+  chatId: number,
+  filename: string,
+  content: string,
+  mimeType = "text/csv"
+): Promise<void> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  form.append("document", new Blob([content], { type: mimeType }), filename);
+
+  const res = await fetch(`${apiUrl}/sendDocument`, { method: "POST", body: form });
+  const data = (await res.json()) as { ok: boolean; description?: string };
+  if (!data.ok) throw new Error(`Telegram sendDocument failed: ${data.description}`);
+}
+
 /** Long-poll for new updates. Returns updates with offset already advanced by the caller. */
 export async function getUpdates(offset: number, timeoutSeconds = 30): Promise<Update[]> {
   return call<Update[]>("getUpdates", {
